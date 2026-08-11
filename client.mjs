@@ -1,14 +1,22 @@
-// Plugin Seedbox qBittorrent — partie client (JS pur, sans build).
+// Plugin Seedbox — partie client (JS pur, sans build).
 // Les composants sont des objets Vue à `template` string, compilés par le runtimeCompiler
 // de l'hôte. Vue vient de l'hôte via api.vue — ne JAMAIS importer vue ici.
+// Les réglages sont gérés ICI (ancre plugin.settings.seedbox-qbit) : liste de configs
+// multi-providers (qBittorrent, Hydra…), test d'un brouillon SANS l'enregistrer.
 export default function setup(api) {
-  const { ref, computed, watch, onMounted, onUnmounted } = api.vue
+  const { ref, reactive, computed, watch, onMounted, onUnmounted } = api.vue
   const IconSend = api.ui.icons.HardDriveDownload
   const IconCross = api.ui.icons.Shuffle
   const IconCheck = api.ui.icons.Check
+  const IconPlus = api.ui.icons.Plus
+  const IconPencil = api.ui.icons.Pencil
+  const IconTrash = api.ui.icons.Trash2
+  const IconStar = api.ui.icons.Star
+  const IconSave = api.ui.icons.Save
 
   // ================= index de la seedbox (matching des releases) =================
-  // map = [{hash, name, size, tracker, progress}] ; null tant que non chargé/indisponible.
+  // map = [{hash, name, size, tracker, progress, config}] — agrégé sur TOUTES les configs ;
+  // null tant que non chargé/indisponible.
   const map = ref(null)
   let byHash = new Map()
   let byName = new Map()
@@ -45,7 +53,7 @@ export default function setup(api) {
    *  'cross'   = même release présente via un AUTRE tracker → cross-seed possible
    *  Candidats = même nom normalisé OU même taille EXACTE à l'octet. La taille exacte est
    *  indispensable pour la LISTE : elle n'expose pas info_hash, et le nom affiché par le
-   *  tracker est souvent décoré (« … (Titre français) ») ≠ nom du torrent dans qBittorrent. */
+   *  tracker est souvent décoré (« … (Titre français) ») ≠ nom du torrent côté client. */
   function matchFor(t) {
     if (!map.value || !t) return { status: null }
     const h = String(t.info_hash || '').toLowerCase()
@@ -84,7 +92,7 @@ export default function setup(api) {
 
   // ================= bouton d'action : envoyer / cross-seed / déjà là =================
   const SendBtn = {
-    props: ['ctx', 'wide'],
+    props: { ctx: Object, wide: Boolean },
     components: { IconSend, IconCross, IconCheck },
     template: `
       <span v-if="state === 'seedbox'" class="iconbtn" style="cursor:default; color:var(--accent); border-color:transparent"
@@ -113,7 +121,7 @@ export default function setup(api) {
         try {
           await api.fetch('/add', { method: 'POST', body: { slug: props.ctx.slug } })
           local.value = 'seedbox'
-          api.ui.toast('Seedbox', `« ${props.ctx.name || props.ctx.slug} » envoyé à qBittorrent`)
+          api.ui.toast('Seedbox', `« ${props.ctx.name || props.ctx.slug} » envoyé à la seedbox`)
           loadMap()
         } catch (e) {
           api.ui.toast('Seedbox : échec', e?.data?.statusMessage || e?.message || 'Erreur inconnue')
@@ -124,9 +132,9 @@ export default function setup(api) {
         busy.value = true
         try {
           const target = matchFor(props.ctx).e
-          const r = await api.fetch('/cross-seed', { method: 'POST', body: { slug: props.ctx.slug, target_hash: target.hash } })
+          const r = await api.fetch('/cross-seed', { method: 'POST', body: { slug: props.ctx.slug, target_hash: target.hash, config: target.config } })
           local.value = 'seedbox'
-          api.ui.toast('Cross-seed lancé', `Ajouté dans ${r.savepath} — qBittorrent vérifie les fichiers existants puis seed`)
+          api.ui.toast('Cross-seed lancé', `Ajouté dans ${r.savepath} — le client vérifie les fichiers existants puis seed`)
           loadMap()
         } catch (e) {
           api.ui.toast('Cross-seed : échec', e?.data?.statusMessage || e?.message || 'Erreur inconnue')
@@ -180,9 +188,10 @@ export default function setup(api) {
       async function cross() {
         busy.value = true
         try {
-          const r = await api.fetch('/cross-seed', { method: 'POST', body: { slug: props.ctx.kept_slug, target_hash: target().hash } })
+          const t = target()
+          const r = await api.fetch('/cross-seed', { method: 'POST', body: { slug: props.ctx.kept_slug, target_hash: t.hash, config: t.config } })
           local.value = 'done'
-          api.ui.toast('Cross-seed lancé', `Version conservée ajoutée dans ${r.savepath} — qBittorrent vérifie puis seed`)
+          api.ui.toast('Cross-seed lancé', `Version conservée ajoutée dans ${r.savepath} — le client vérifie puis seed`)
           loadMap()
         } catch (e) {
           api.ui.toast('Cross-seed : échec', e?.data?.statusMessage || e?.message || 'Erreur inconnue')
@@ -194,7 +203,7 @@ export default function setup(api) {
         try {
           await api.fetch('/add', { method: 'POST', body: { slug: props.ctx.kept_slug } })
           local.value = 'done'
-          api.ui.toast('Seedbox', `« ${props.ctx.kept_name} » envoyé à qBittorrent`)
+          api.ui.toast('Seedbox', `« ${props.ctx.kept_name} » envoyé à la seedbox`)
           loadMap()
         } catch (e) {
           api.ui.toast('Seedbox : échec', e?.data?.statusMessage || e?.message || 'Erreur inconnue')
@@ -230,31 +239,166 @@ export default function setup(api) {
     return list.filter((t) => matchFor(t).status !== 'seedbox')
   })
 
-  // ================= bouton « Tester la connexion » sous le formulaire de réglages =================
+  // ================= réglages : gestionnaire de configurations (multi-providers) =================
+  // Remplace le formulaire standard de l'hôte (plugin.json ne déclare plus de champs).
+  // « Tester » éprouve le BROUILLON via POST /configs/test — rien n'est enregistré.
   api.ui.registerSlot('plugin.settings.seedbox-qbit', {
+    components: { IconPlus, IconPencil, IconTrash, IconStar, IconSave, IconCheck },
     template: `
-      <div style="margin-top:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap">
-        <button class="ghost small" :disabled="busy" @click="test">
-          <span v-if="busy" class="spin" /> Tester la connexion
+      <div v-if="loading" class="empty"><span class="spin" /></div>
+      <div v-else style="display:flex; flex-direction:column; gap:12px; max-width:560px">
+
+        <!-- liste des configs -->
+        <div v-for="c in configs" :key="c.id"
+             style="display:flex; gap:10px; align-items:center; padding:9px 12px; border:1px solid var(--line); border-radius:10px">
+          <div style="min-width:0; flex:1">
+            <b style="font-size:13px">{{ c.name }}</b>
+            <span class="badge" style="margin-left:8px">{{ providerLabel(c.provider) }}</span>
+            <span v-if="c.id === defaultId" class="badge b-cat" style="margin-left:6px" title="Config utilisée par défaut pour les envois">défaut</span>
+            <div class="muted mono" style="font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ c.values.url }}</div>
+          </div>
+          <button v-if="c.id !== defaultId" class="iconbtn" title="Utiliser par défaut" @click="setDefault(c)"><IconStar :size="14" /></button>
+          <button class="iconbtn" title="Modifier" @click="edit(c)"><IconPencil :size="14" /></button>
+          <button class="iconbtn" title="Supprimer" @click="del(c)"><IconTrash :size="14" /></button>
+        </div>
+
+        <button v-if="!editing" class="ghost small" style="align-self:flex-start" @click="add">
+          <IconPlus :size="14" /> Ajouter une configuration
         </button>
-        <span v-if="result" :style="result.ok ? 'color:var(--accent); font-size:12.5px' : 'color:#ff6b6b; font-size:12.5px'">
-          {{ result.ok ? '● Connecté — qBittorrent v' + (result.version || '?') : '○ ' + result.error }}
-        </span>
-        <span class="muted" style="font-size:11px; flex-basis:100%">Teste les réglages ENREGISTRÉS — pense à enregistrer d'abord.</span>
+
+        <!-- formulaire (ajout / édition) -->
+        <form v-if="editing" style="display:flex; flex-direction:column; gap:11px; padding:13px 14px; border:1px solid var(--line); border-radius:10px"
+              @submit.prevent="save">
+          <label style="display:flex; flex-direction:column; gap:5px">
+            <span style="font-size:12px">Nom *</span>
+            <input v-model="editing.name" type="text" placeholder="Ma seedbox" autocomplete="off" />
+          </label>
+          <label style="display:flex; flex-direction:column; gap:5px">
+            <span style="font-size:12px">Client torrent</span>
+            <select v-model="editing.provider">
+              <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.label }}</option>
+            </select>
+          </label>
+          <label v-for="f in fieldsOf(editing.provider)" :key="f.key" style="display:flex; flex-direction:column; gap:5px">
+            <span style="font-size:12px">{{ f.label }}<template v-if="f.required"> *</template></span>
+            <select v-if="f.type === 'select'" v-model="editing.values[f.key]">
+              <option v-for="o in f.options || []" :key="o.value" :value="o.value">{{ o.label }}</option>
+            </select>
+            <input v-else v-model="editing.values[f.key]"
+                   :type="f.type === 'password' ? 'password' : f.type === 'number' ? 'number' : 'text'"
+                   :placeholder="f.placeholder" autocomplete="off" />
+            <span v-if="f.help" class="muted" style="font-size:11px">{{ f.help }}</span>
+          </label>
+
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:2px">
+            <button type="button" class="ghost small" :disabled="busy" title="Teste ce brouillon sans rien enregistrer" @click="test">
+              <span v-if="busy === 'test'" class="spin" /> Tester
+            </button>
+            <button type="button" class="ghost small" :disabled="busy" title="Teste puis enregistre si la connexion répond" @click="testAndSave">
+              <span v-if="busy === 'testsave'" class="spin" /><IconCheck v-else :size="13" /> Tester et enregistrer
+            </button>
+            <button type="submit" class="primary small" :disabled="busy">
+              <span v-if="busy === 'save'" class="spin" /><IconSave v-else :size="13" /> Enregistrer
+            </button>
+            <button type="button" class="ghost small" :disabled="busy" @click="editing = null">Annuler</button>
+            <span v-if="result" :style="result.ok ? 'color:var(--accent); font-size:12.5px' : 'color:#ff6b6b; font-size:12.5px'">
+              {{ result.ok ? '● Connecté' + (result.version ? ' — ' + result.version : '') : '○ ' + result.error }}
+            </span>
+          </div>
+        </form>
       </div>`,
     setup() {
-      const busy = ref(false)
+      const loading = ref(true)
+      const providers = ref([])
+      const configs = ref([])
+      const defaultId = ref('')
+      const editing = ref(null)
+      const busy = ref('') // '' | 'test' | 'save' | 'testsave'
       const result = ref(null)
+
+      const providerLabel = (id) => providers.value.find((p) => p.id === id)?.label || id
+      const fieldsOf = (id) => providers.value.find((p) => p.id === id)?.fields || []
+
+      async function load() {
+        try {
+          const [p, c] = await Promise.all([api.fetch('/providers'), api.fetch('/configs')])
+          providers.value = p
+          configs.value = c.configs
+          defaultId.value = c.defaultConfig
+        } catch (e) {
+          api.ui.toast('Seedbox : réglages indisponibles', e?.data?.statusMessage || e?.message)
+        }
+        loading.value = false
+      }
+      load()
+
+      function withDefaults(providerId, values = {}) {
+        const v = { ...values }
+        for (const f of fieldsOf(providerId)) if (!(f.key in v)) v[f.key] = f.default ?? (f.type === 'boolean' ? false : '')
+        return v
+      }
+      function add() {
+        const provider = providers.value[0]?.id || 'qbittorrent'
+        editing.value = reactive({ name: '', provider, values: withDefaults(provider) })
+        result.value = null
+      }
+      function edit(c) {
+        editing.value = reactive({ id: c.id, name: c.name, provider: c.provider, values: withDefaults(c.provider, { ...c.values }) })
+        result.value = null
+      }
+      // changement de provider : on complète les défauts de ses champs (l'URL saisie est conservée)
+      watch(() => editing.value?.provider, (id) => {
+        if (id && editing.value) editing.value.values = withDefaults(id, editing.value.values)
+      })
+
       async function test() {
-        busy.value = true
+        busy.value = busy.value || 'test'
         result.value = null
         try {
-          result.value = await api.fetch('/test')
-          if (result.value.ok) loadMap()
-        } catch (e) { result.value = { ok: false, error: e?.data?.statusMessage || e?.message || 'Erreur' } }
-        busy.value = false
+          result.value = await api.fetch('/configs/test', { method: 'POST', body: { config: { ...editing.value } } })
+        } catch (e) {
+          result.value = { ok: false, error: e?.data?.statusMessage || e?.message || 'Erreur' }
+        }
+        if (busy.value === 'test') busy.value = ''
+        return !!result.value?.ok
       }
-      return { busy, result, test }
+      async function save() {
+        busy.value = busy.value || 'save'
+        try {
+          const r = await api.fetch('/configs/save', { method: 'POST', body: { config: { ...editing.value } } })
+          defaultId.value = r.defaultConfig
+          editing.value = null
+          api.ui.toast('Seedbox', `Configuration « ${r.config.name} » enregistrée`)
+          await load()
+          loadMap()
+        } catch (e) {
+          api.ui.toast('Seedbox : échec de l’enregistrement', e?.data?.statusMessage || e?.message)
+        }
+        busy.value = ''
+      }
+      async function testAndSave() {
+        busy.value = 'testsave'
+        if (await test()) await save()
+        else busy.value = ''
+      }
+      async function setDefault(c) {
+        try {
+          const r = await api.fetch('/configs/default', { method: 'POST', body: { id: c.id } })
+          defaultId.value = r.defaultConfig
+        } catch (e) { api.ui.toast('Seedbox : échec', e?.data?.statusMessage || e?.message) }
+      }
+      async function del(c) {
+        if (!confirm(`Supprimer la configuration « ${c.name} » ?`)) return
+        try {
+          const r = await api.fetch('/configs/delete', { method: 'POST', body: { id: c.id } })
+          defaultId.value = r.defaultConfig
+          if (editing.value?.id === c.id) editing.value = null
+          await load()
+          loadMap()
+        } catch (e) { api.ui.toast('Seedbox : échec', e?.data?.statusMessage || e?.message) }
+      }
+
+      return { loading, providers, configs, defaultId, editing, busy, result, providerLabel, fieldsOf, add, edit, test, save, testAndSave, setDefault, del }
     },
   })
 
@@ -266,52 +410,65 @@ export default function setup(api) {
         <h1 style="margin:0; font-size:19px; display:flex; gap:9px; align-items:center"><IconSend :size="20" /> Seedbox</h1>
 
         <div v-if="!configured" class="pill-note">
-          Seedbox non configurée : renseigne l'URL du WebUI dans la page <b>Plugins → Seedbox qBittorrent → Réglages</b>.
+          Seedbox non configurée : ajoute une configuration dans la page <b>Plugins → Seedbox → Réglages</b>.
         </div>
 
-        <div v-else class="card" style="display:flex; gap:18px; align-items:center; flex-wrap:wrap">
-          <span v-if="status && status.ok" style="color:var(--accent)">● Connecté</span>
-          <span v-else-if="status" style="color:#ff6b6b">○ {{ status.error }}</span>
-          <span v-else class="muted"><span class="spin" /> Connexion…</span>
-          <template v-if="status && status.ok">
-            <span class="mono muted" style="font-size:12px">↓ {{ fmtSpeed(status.dl) }}</span>
-            <span class="mono muted" style="font-size:12px">↑ {{ fmtSpeed(status.up) }}</span>
-            <span class="mono muted" style="font-size:12px">{{ torrents.length }} torrent(s)</span>
-          </template>
-          <span style="flex:1" />
-          <button class="ghost small" :disabled="loading" @click="refresh">Actualiser</button>
-        </div>
+        <template v-else>
+          <!-- sélecteur de config quand il y en a plusieurs -->
+          <div v-if="configs.length > 1" style="display:flex; gap:8px; flex-wrap:wrap">
+            <button v-for="c in configs" :key="c.id" class="chip" :class="{ on: c.id === selected }" @click="select(c.id)">
+              {{ c.name }}
+            </button>
+          </div>
 
-        <div v-if="status && status.ok" class="tablewrap">
-          <table>
-            <thead><tr><th>Nom</th><th class="num">Progression</th><th>État</th><th class="num">↓</th><th class="num">↑</th><th class="num">Ratio</th><th class="num">Taille</th></tr></thead>
-            <tbody>
-              <tr v-for="t in torrents" :key="t.hash">
-                <td class="grow" style="font-size:12.5px; max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap" :title="t.name">{{ t.name }}</td>
-                <td class="num mono">{{ Math.round((t.progress || 0) * 100) }} %</td>
-                <td><span class="badge" :class="stateClass(t.state)">{{ stateLabel(t.state) }}</span></td>
-                <td class="num mono">{{ fmtSpeed(t.dlspeed) }}</td>
-                <td class="num mono">{{ fmtSpeed(t.upspeed) }}</td>
-                <td class="num mono">{{ (t.ratio || 0).toFixed(2) }}</td>
-                <td class="num mono">{{ fmtBytes(t.size) }}</td>
-              </tr>
-              <tr v-if="!torrents.length"><td colspan="7" class="empty">Aucun torrent sur la seedbox.</td></tr>
-            </tbody>
-          </table>
-        </div>
+          <div class="card" style="display:flex; gap:18px; align-items:center; flex-wrap:wrap">
+            <span v-if="status && status.ok" style="color:var(--accent)">● Connecté</span>
+            <span v-else-if="status" style="color:#ff6b6b">○ {{ status.error }}</span>
+            <span v-else class="muted"><span class="spin" /> Connexion…</span>
+            <template v-if="status && status.ok">
+              <span class="mono muted" style="font-size:12px">↓ {{ fmtSpeed(status.dl) }}</span>
+              <span class="mono muted" style="font-size:12px">↑ {{ fmtSpeed(status.up) }}</span>
+              <span class="mono muted" style="font-size:12px">{{ torrents.length }} torrent(s)</span>
+            </template>
+            <span style="flex:1" />
+            <button class="ghost small" :disabled="loading" @click="refresh">Actualiser</button>
+          </div>
+
+          <div v-if="status && status.ok" class="tablewrap">
+            <table>
+              <thead><tr><th>Nom</th><th class="num">Progression</th><th>État</th><th class="num">↓</th><th class="num">↑</th><th class="num">Ratio</th><th class="num">Taille</th></tr></thead>
+              <tbody>
+                <tr v-for="t in torrents" :key="t.hash">
+                  <td class="grow" style="font-size:12.5px; max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap" :title="t.name">{{ t.name }}</td>
+                  <td class="num mono">{{ Math.round((t.progress || 0) * 100) }} %</td>
+                  <td><span class="badge" :class="stateClass(t.state)">{{ stateLabel(t.state) }}</span></td>
+                  <td class="num mono">{{ fmtSpeed(t.dlspeed) }}</td>
+                  <td class="num mono">{{ fmtSpeed(t.upspeed) }}</td>
+                  <td class="num mono">{{ (t.ratio || 0).toFixed(2) }}</td>
+                  <td class="num mono">{{ fmtBytes(t.size) }}</td>
+                </tr>
+                <tr v-if="!torrents.length"><td colspan="7" class="empty">Aucun torrent sur cette seedbox.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
       </div>`,
     setup() {
       const torrents = ref([])
       const status = ref(null)
       const loading = ref(false)
       const configured = ref(true)
+      const configs = ref([])
+      const selected = ref('')
       let timer = null
       async function refresh() {
         loading.value = true
         try {
-          const s = await api.fetch('/status')
-          status.value = { ok: true, dl: s.dl_info_speed, up: s.up_info_speed }
-          torrents.value = await api.fetch('/torrents')
+          const r = await api.fetch('/torrents', { query: selected.value ? { config: selected.value } : {} })
+          // transfer = null quand le client n'expose pas les débits globaux (ex. Hydra)
+          status.value = { ok: true, dl: r.transfer?.dl ?? null, up: r.transfer?.up ?? null }
+          torrents.value = r.torrents
+          if (!selected.value) selected.value = r.config.id
         } catch (e) {
           const msg = e?.data?.statusMessage || e?.message || 'Erreur'
           if (e?.status === 400 || e?.statusCode === 400) configured.value = false
@@ -319,7 +476,22 @@ export default function setup(api) {
         }
         loading.value = false
       }
-      onMounted(() => { refresh(); timer = setInterval(refresh, 5000) })
+      function select(id) {
+        if (selected.value === id) return
+        selected.value = id
+        status.value = null
+        torrents.value = []
+        refresh()
+      }
+      onMounted(async () => {
+        try {
+          const c = await api.fetch('/configs')
+          configs.value = c.configs
+          selected.value = c.defaultConfig
+        } catch {}
+        refresh()
+        timer = setInterval(refresh, 5000)
+      })
       onUnmounted(() => clearInterval(timer))
       const fmtSpeed = (b) => !b ? '—' : b >= 1048576 ? (b / 1048576).toFixed(1) + ' Mo/s' : Math.round(b / 1024) + ' Ko/s'
       const fmtBytes = (b) => !b ? '—' : b >= 1073741824 ? (b / 1073741824).toFixed(2) + ' Go' : (b / 1048576).toFixed(0) + ' Mo'
@@ -330,7 +502,7 @@ export default function setup(api) {
         checkingDL: 'Vérification', checkingUP: 'Vérification', error: 'Erreur', missingFiles: 'Fichiers manquants',
       })[s] || s
       const stateClass = (s) => /error|missing/i.test(s) ? 'b-bad' : /up|seed/i.test(s) ? 'b-cat' : ''
-      return { torrents, status, loading, configured, refresh, fmtSpeed, fmtBytes, stateLabel, stateClass }
+      return { torrents, status, loading, configured, configs, selected, select, refresh, fmtSpeed, fmtBytes, stateLabel, stateClass }
     },
   }
   api.ui.registerPage({ path: '/p/seedbox-qbit', component: Page, title: 'Seedbox', icon: 'HardDriveDownload', order: 40 })

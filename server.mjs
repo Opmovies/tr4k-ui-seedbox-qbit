@@ -1,164 +1,223 @@
-// Plugin Seedbox qBittorrent — partie serveur (WebUI API v2).
+// Plugin Seedbox — partie serveur.
 // Pas de node_modules ici : tout vient de ctx (auth, settings, lib.tr4kDownload, h3…).
-// Sessions qbit par utilisateur (chaque user peut avoir SA seedbox), mutex de login
-// (qBittorrent 5.x bannit l'IP après plusieurs échecs), UNE seule re-login sur 403.
+// Les clients torrent sont derrière un CONTRAT commun (voir providers/index.mjs) :
+// qBittorrent, Hydra… Les réglages sont une LISTE de configs nommées (multi-seedbox),
+// stockées chiffrées par l'hôte via ctx.settings/saveSettings.
 
-const sessions = new Map() // userKey -> { sid, loggingIn: Promise|null }
+import { randomUUID } from 'node:crypto'
+import { providers, getProvider, providersMeta } from './providers/index.mjs'
 
-function cfgBase(ctx) {
-  const url = (ctx.settings.url || '').trim().replace(/\/+$/, '')
-  if (!url) throw ctx.h3.createError({ statusCode: 400, statusMessage: 'Seedbox non configurée (URL du WebUI manquante)' })
-  if (!/^https?:\/\//.test(url)) throw ctx.h3.createError({ statusCode: 400, statusMessage: 'URL du WebUI invalide (http(s)://…)' })
-  return url
-}
+const SENTINEL = '••••' // même sentinelle que l'hôte : reçue = « valeur inchangée »
 
-async function login(ctx, base) {
-  let res
-  try {
-    res = await fetch(`${base}/api/v2/auth/login`, {
-      method: 'POST',
-      // Referer/Origin exigés par certaines versions de qBittorrent (protection CSRF)
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Referer: base, Origin: base },
-      body: new URLSearchParams({ username: ctx.settings.username || '', password: ctx.settings.password || '' }),
-      signal: AbortSignal.timeout(8000),
-    })
-  } catch (e) {
-    throw ctx.h3.createError({ statusCode: 502, statusMessage: `Seedbox injoignable : ${e?.cause?.code || e?.name || e?.message}` })
+const io = (ctx) => ({ createError: ctx.h3.createError })
+
+// ================= store des configs (migration v1 → v2 incluse) =================
+
+function getStore(ctx) {
+  const s = ctx.settings || {}
+  if (Array.isArray(s.configs)) return { configs: s.configs, defaultConfig: s.defaultConfig || s.configs[0]?.id || '' }
+  // v1 : réglages plats {url, username, password, category} → une config qBittorrent
+  if ((s.url || '').trim()) {
+    const c = { id: 'c' + randomUUID().slice(0, 8), name: 'Ma seedbox', provider: 'qbittorrent',
+      values: { url: s.url, username: s.username || '', password: s.password || '', category: s.category ?? 'tr4k' } }
+    const store = { configs: [c], defaultConfig: c.id }
+    ctx.saveSettings(store)
+    ctx.log('réglages v1 migrés vers le format multi-configs')
+    return store
   }
-  const text = await res.text().catch(() => '')
-  if (!res.ok || text.trim() !== 'Ok.')
-    throw ctx.h3.createError({ statusCode: 502, statusMessage: `Login qBittorrent refusé (${res.status}${text ? ' — ' + text.trim().slice(0, 60) : ''})` })
-  const sid = (res.headers.get('set-cookie') || '').match(/SID=([^;]+)/)?.[1]
-  if (!sid) throw ctx.h3.createError({ statusCode: 502, statusMessage: 'qBittorrent n’a pas renvoyé de cookie SID' })
-  return sid
+  return { configs: [], defaultConfig: '' }
 }
 
-async function ensureSid(ctx, base, force = false) {
-  let s = sessions.get(ctx.userKey)
-  if (!s) sessions.set(ctx.userKey, (s = { sid: null, loggingIn: null }))
-  if (force) s.sid = null
-  if (s.sid) return s.sid
-  if (!s.loggingIn) s.loggingIn = login(ctx, base).finally(() => { s.loggingIn = null })
-  s.sid = await s.loggingIn
-  return s.sid
+const saveStore = (ctx, store) => ctx.saveSettings({ configs: store.configs, defaultConfig: store.defaultConfig })
+
+function maskConfig(c) {
+  const p = providers[c.provider]
+  const values = { ...c.values }
+  for (const f of p?.fields || []) if (f.secret && values[f.key]) values[f.key] = SENTINEL
+  return { ...c, values }
 }
 
-async function qbit(ctx, path, init = {}) {
-  const base = cfgBase(ctx)
-  let sid = await ensureSid(ctx, base)
-  const doFetch = async () => {
-    try {
-      return await fetch(`${base}/api/v2${path}`, {
-        ...init,
-        headers: { ...(init.headers || {}), Cookie: `SID=${sid}`, Referer: base },
-        signal: AbortSignal.timeout(15000),
-      })
-    } catch (e) {
-      throw ctx.h3.createError({ statusCode: 502, statusMessage: `Seedbox injoignable : ${e?.cause?.code || e?.name || e?.message}` })
-    }
+/** Remplace les sentinelles d'un brouillon par les valeurs stockées (si la config existe déjà). */
+function resolveSecrets(provider, values, stored) {
+  const out = { ...values }
+  for (const f of provider.fields || []) {
+    if (f.secret && out[f.key] === SENTINEL) out[f.key] = stored?.values?.[f.key] || ''
   }
-  let res = await doFetch()
-  if (res.status === 403) { // SID expiré → une seule re-login, jamais en boucle
-    sid = await ensureSid(ctx, base, true)
-    res = await doFetch()
-  }
-  if (!res.ok) throw ctx.h3.createError({ statusCode: 502, statusMessage: `qBittorrent a répondu ${res.status} sur ${path}` })
-  return res
+  return out
 }
 
-// index condensé de la seedbox pour le matching côté client — caché 30 s par utilisateur
-const mapCache = new Map() // userKey -> { at, data }
+function pickConfig(ctx, id) {
+  const store = getStore(ctx)
+  if (!store.configs.length)
+    throw ctx.h3.createError({ statusCode: 400, statusMessage: 'Seedbox non configurée (aucune configuration)' })
+  const c = id ? store.configs.find((x) => x.id === id) : null
+  if (id && !c) throw ctx.h3.createError({ statusCode: 404, statusMessage: 'Configuration inconnue' })
+  return c || store.configs.find((x) => x.id === store.defaultConfig) || store.configs[0]
+}
+
+const cfgFor = (ctx, c) => ({ ...c.values, _key: `${ctx.userKey}:${c.id}` })
+
+// ================= cache serveur des listes (30 s par user+config) =================
+
+const listCache = new Map() // `${userKey}:${configId}` -> { at, data }
+
+async function cachedList(ctx, c) {
+  const key = `${ctx.userKey}:${c.id}`
+  const hit = listCache.get(key)
+  if (hit && Date.now() - hit.at < 30_000) return hit.data
+  const data = await getProvider(c.provider, io(ctx)).list(cfgFor(ctx, c), io(ctx))
+  listCache.set(key, { at: Date.now(), data })
+  return data
+}
+
+const invalidate = (ctx, c) => listCache.delete(`${ctx.userKey}:${c.id}`)
+
+// ================= envoi d'un .torrent TR4KER vers une config =================
+
+async function pushTorrent(ctx, c, slug, { savepath, skipChecking } = {}) {
+  const tor = await ctx.lib.tr4kDownload(slug, ctx.auth)
+  if (!tor.ok) throw ctx.h3.createError({ statusCode: 502, statusMessage: `Téléchargement du .torrent refusé (${tor.status})` })
+  await getProvider(c.provider, io(ctx)).add(cfgFor(ctx, c), io(ctx), {
+    buf: await tor.arrayBuffer(),
+    filename: `${slug}.torrent`,
+    category: c.values.category || '',
+    savepath,
+    skipChecking,
+  })
+  invalidate(ctx, c)
+}
 
 export const routes = {
-  // liste minimale {hash, name, size, tracker, progress} pour taguer les releases côté client
-  'GET /map': async (event, ctx) => {
-    const hit = mapCache.get(ctx.userKey)
-    if (hit && Date.now() - hit.at < 30_000) return hit.data
-    const list = await (await qbit(ctx, '/torrents/info?limit=5000')).json()
-    const data = list.map((t) => ({
-      hash: (t.hash || '').toLowerCase(),
-      name: t.name || '',
-      size: t.total_size || t.size || 0,
-      tracker: t.tracker || '',
-      progress: t.progress ?? 0,
-    }))
-    mapCache.set(ctx.userKey, { at: Date.now(), data })
-    return data
+  // ---- providers & configs ----
+
+  'GET /providers': async () => providersMeta(),
+
+  'GET /configs': async (event, ctx) => {
+    const store = getStore(ctx)
+    return { configs: store.configs.map(maskConfig), defaultConfig: store.defaultConfig }
   },
 
-  // cross-seed : la même release existe sur la seedbox via un AUTRE tracker →
-  // on ajoute le .torrent TR4KER dans le dossier du torrent existant ; qBittorrent
-  // vérifie les fichiers déjà présents à l'ajout puis seed s'ils correspondent
-  'POST /cross-seed': async (event, ctx) => {
-    const slug = String(ctx.body?.slug || '').trim()
-    const target = String(ctx.body?.target_hash || '').trim().toLowerCase()
-    if (!/^[a-z0-9-]+$/.test(slug) || !/^[a-f0-9]{40}$/.test(target))
-      throw ctx.h3.createError({ statusCode: 400, statusMessage: 'slug et target_hash requis' })
-
-    const infos = await (await qbit(ctx, `/torrents/info?hashes=${target}`)).json()
-    const existing = infos?.[0]
-    if (!existing?.save_path) throw ctx.h3.createError({ statusCode: 404, statusMessage: 'Torrent cible introuvable sur la seedbox' })
-
-    const tor = await ctx.lib.tr4kDownload(slug, ctx.auth)
-    if (!tor.ok) throw ctx.h3.createError({ statusCode: 502, statusMessage: `Téléchargement du .torrent refusé (${tor.status})` })
-    const fd = new FormData()
-    fd.append('torrents', new Blob([await tor.arrayBuffer()], { type: 'application/x-bittorrent' }), `${slug}.torrent`)
-    fd.append('savepath', existing.save_path)
-    fd.append('autoTMM', 'false') // sinon qbit ignorerait savepath
-    if (ctx.settings.category) fd.append('category', ctx.settings.category)
-
-    const res = await qbit(ctx, '/torrents/add', { method: 'POST', body: fd })
-    const txt = (await res.text().catch(() => '')).trim()
-    if (txt === 'Fails.') throw ctx.h3.createError({ statusCode: 409, statusMessage: 'qBittorrent a refusé le torrent (déjà présent ?)' })
-    mapCache.delete(ctx.userKey)
-    ctx.log(`cross-seed ${slug} → ${existing.save_path}`)
-    return { ok: true, slug, savepath: existing.save_path }
+  // crée ou met à jour une config ; les champs secret à '••••' gardent la valeur stockée
+  'POST /configs/save': async (event, ctx) => {
+    const c = ctx.body?.config || {}
+    const name = String(c.name || '').trim()
+    if (!name) throw ctx.h3.createError({ statusCode: 400, statusMessage: 'Nom de configuration requis' })
+    const provider = getProvider(String(c.provider || ''), io(ctx))
+    const store = getStore(ctx)
+    const existing = c.id ? store.configs.find((x) => x.id === c.id) : null
+    if (c.id && !existing) throw ctx.h3.createError({ statusCode: 404, statusMessage: 'Configuration inconnue' })
+    const saved = {
+      id: existing?.id || 'c' + randomUUID().slice(0, 8),
+      name,
+      provider: provider.id,
+      values: resolveSecrets(provider, c.values || {}, existing),
+    }
+    if (existing) store.configs = store.configs.map((x) => (x.id === saved.id ? saved : x))
+    else store.configs = [...store.configs, saved]
+    if (!store.defaultConfig) store.defaultConfig = saved.id
+    saveStore(ctx, store)
+    invalidate(ctx, saved)
+    ctx.log(`config « ${name} » (${provider.id}) enregistrée`)
+    return { ok: true, config: maskConfig(saved), defaultConfig: store.defaultConfig }
   },
 
-  // test de connexion EXPLICITE : re-login forcé (vérifie les identifiants, pas un SID en cache)
-  // puis lecture de la version — renvoie toujours 200 avec {ok, …} pour un affichage inline propre
-  'GET /test': async (event, ctx) => {
+  'POST /configs/delete': async (event, ctx) => {
+    const id = String(ctx.body?.id || '')
+    const store = getStore(ctx)
+    if (!store.configs.some((x) => x.id === id)) throw ctx.h3.createError({ statusCode: 404, statusMessage: 'Configuration inconnue' })
+    store.configs = store.configs.filter((x) => x.id !== id)
+    if (store.defaultConfig === id) store.defaultConfig = store.configs[0]?.id || ''
+    saveStore(ctx, store)
+    listCache.delete(`${ctx.userKey}:${id}`)
+    return { ok: true, defaultConfig: store.defaultConfig }
+  },
+
+  'POST /configs/default': async (event, ctx) => {
+    const id = String(ctx.body?.id || '')
+    const store = getStore(ctx)
+    if (!store.configs.some((x) => x.id === id)) throw ctx.h3.createError({ statusCode: 404, statusMessage: 'Configuration inconnue' })
+    store.defaultConfig = id
+    saveStore(ctx, store)
+    return { ok: true, defaultConfig: id }
+  },
+
+  // teste un BROUILLON de config sans rien enregistrer — répond toujours 200 {ok, …}
+  // pour un affichage inline propre. Les '••••' sont résolus depuis la config stockée.
+  'POST /configs/test': async (event, ctx) => {
     try {
-      const base = cfgBase(ctx)
-      const sid = await login(ctx, base)
-      const s = sessions.get(ctx.userKey) || { sid: null, loggingIn: null }
-      s.sid = sid // profite du login frais pour les appels suivants
-      sessions.set(ctx.userKey, s)
-      const vRes = await fetch(`${base}/api/v2/app/version`, {
-        headers: { Cookie: `SID=${sid}`, Referer: base }, signal: AbortSignal.timeout(8000),
-      })
-      const version = vRes.ok ? (await vRes.text()).trim() : ''
-      const info = await (await qbit(ctx, '/transfer/info')).json()
-      return { ok: true, version, dl: info.dl_info_speed, up: info.up_info_speed }
+      const c = ctx.body?.config || {}
+      const provider = getProvider(String(c.provider || ''), io(ctx))
+      const store = getStore(ctx)
+      const existing = c.id ? store.configs.find((x) => x.id === c.id) : null
+      const values = resolveSecrets(provider, c.values || {}, existing)
+      return await provider.test({ ...values, _key: `${ctx.userKey}:${existing?.id || 'draft'}` }, io(ctx))
     } catch (e) {
       return { ok: false, error: e?.statusMessage || e?.message || 'Erreur inconnue' }
     }
   },
 
-  // état global des transferts
-  'GET /status': async (event, ctx) => (await qbit(ctx, '/transfer/info')).json(),
+  // ---- torrents ----
 
-  // liste des torrents distants, plus récents d'abord
-  'GET /torrents': async (event, ctx) => (await qbit(ctx, '/torrents/info?sort=added_on&reverse=true&limit=200')).json(),
+  // index condensé AGRÉGÉ sur toutes les configs, pour le matching côté client.
+  // Une config injoignable est ignorée (les autres continuent de répondre) ;
+  // si TOUTES échouent, on relaie la première erreur.
+  'GET /map': async (event, ctx) => {
+    const store = getStore(ctx)
+    if (!store.configs.length)
+      throw ctx.h3.createError({ statusCode: 400, statusMessage: 'Seedbox non configurée (aucune configuration)' })
+    const out = []
+    let firstErr = null
+    let okCount = 0
+    for (const c of store.configs) {
+      try {
+        const list = await cachedList(ctx, c)
+        okCount++
+        for (const t of list) out.push({ hash: t.hash, name: t.name, size: t.size, tracker: t.tracker, progress: t.progress, config: c.id })
+      } catch (e) {
+        firstErr = firstErr || e
+        ctx.log(`map : config « ${c.name} » injoignable (${e?.statusMessage || e?.message})`)
+      }
+    }
+    if (!okCount && firstErr) throw firstErr
+    return out
+  },
 
-  // envoie un torrent du tracker vers la seedbox : .torrent téléchargé côté serveur
-  // (avec l'auth TR4KER de l'utilisateur, rate-limité par l'hôte) puis push en multipart
+  // état + liste d'une config (?config=<id>, défaut = config par défaut)
+  'GET /torrents': async (event, ctx) => {
+    const c = pickConfig(ctx, String(ctx.query?.config || '') || undefined)
+    const provider = getProvider(c.provider, io(ctx))
+    const transfer = await provider.transfer(cfgFor(ctx, c), io(ctx))
+    const torrents = (await cachedList(ctx, c))
+      .slice()
+      .sort((a, b) => (b.added_on || 0) - (a.added_on || 0))
+      .slice(0, 200)
+    return { config: { id: c.id, name: c.name, provider: c.provider }, transfer, torrents }
+  },
+
+  // envoie un torrent du tracker vers une config : .torrent téléchargé côté serveur
+  // (avec l'auth TR4KER de l'utilisateur, rate-limité par l'hôte) puis push au provider
   'POST /add': async (event, ctx) => {
     const slug = String(ctx.body?.slug || '').trim()
     if (!/^[a-z0-9-]+$/.test(slug)) throw ctx.h3.createError({ statusCode: 400, statusMessage: 'slug requis' })
-    const tor = await ctx.lib.tr4kDownload(slug, ctx.auth)
-    if (!tor.ok) throw ctx.h3.createError({ statusCode: 502, statusMessage: `Téléchargement du .torrent refusé (${tor.status})` })
-    const buf = await tor.arrayBuffer()
+    const c = pickConfig(ctx, String(ctx.body?.config || '') || undefined)
+    await pushTorrent(ctx, c, slug)
+    ctx.log(`torrent ${slug} envoyé à « ${c.name} »`)
+    return { ok: true, slug, config: c.id }
+  },
 
-    const fd = new FormData() // fetch pose le boundary lui-même — ne pas fixer Content-Type
-    fd.append('torrents', new Blob([buf], { type: 'application/x-bittorrent' }), `${slug}.torrent`)
-    if (ctx.settings.category) fd.append('category', ctx.settings.category)
-
-    const res = await qbit(ctx, '/torrents/add', { method: 'POST', body: fd })
-    const txt = (await res.text().catch(() => '')).trim()
-    if (txt === 'Fails.') throw ctx.h3.createError({ statusCode: 409, statusMessage: 'qBittorrent a refusé le torrent (déjà présent ?)' })
-    mapCache.delete(ctx.userKey) // le nouveau torrent doit apparaître dans le prochain /map
-    ctx.log(`torrent ${slug} envoyé à la seedbox`)
-    return { ok: true, slug }
+  // cross-seed : la même release existe sur la seedbox via un AUTRE tracker →
+  // on ajoute le .torrent TR4KER dans le dossier du torrent existant ; le client
+  // torrent vérifie les fichiers déjà présents puis seed s'ils correspondent
+  'POST /cross-seed': async (event, ctx) => {
+    const slug = String(ctx.body?.slug || '').trim()
+    const target = String(ctx.body?.target_hash || '').trim().toLowerCase()
+    if (!/^[a-z0-9-]+$/.test(slug) || !/^[a-f0-9]{40}$/.test(target))
+      throw ctx.h3.createError({ statusCode: 400, statusMessage: 'slug et target_hash requis' })
+    const c = pickConfig(ctx, String(ctx.body?.config || '') || undefined)
+    const existing = (await cachedList(ctx, c)).find((t) => t.hash === target)
+    if (!existing?.save_path) throw ctx.h3.createError({ statusCode: 404, statusMessage: 'Torrent cible introuvable sur la seedbox' })
+    await pushTorrent(ctx, c, slug, { savepath: existing.save_path })
+    ctx.log(`cross-seed ${slug} → ${existing.save_path} (« ${c.name} »)`)
+    return { ok: true, slug, savepath: existing.save_path, config: c.id }
   },
 }

@@ -1,0 +1,42 @@
+// Registre des providers de client torrent + définition du CONTRAT commun.
+//
+// Un provider est un objet qui implémente :
+//
+//   id       : identifiant stable ('qbittorrent', 'hydra'…) — stocké dans chaque config.
+//   label    : nom affiché dans l'UI.
+//   fields   : schéma du formulaire de config, même format que settings.fields du
+//              manifest ({ key, label, type, secret?, required?, default?, help?,
+//              placeholder?, options? }). Les champs `secret` sont masqués par la
+//              sentinelle '••••' côté client et résolus côté serveur.
+//   test(cfg, io)      → { ok: true, version? } | { ok: false, error }
+//                        Vérifie les identifiants SANS RIEN MODIFIER (ni côté client
+//                        torrent, ni côté plugin) : c'est ce qui permet de tester un
+//                        brouillon de config avant de l'enregistrer.
+//   list(cfg, io)      → [{ hash, name, size, progress, tracker, save_path,
+//                           state, ratio, dlspeed, upspeed, added_on }]
+//                        Liste normalisée des torrents. `tracker` et les débits
+//                        peuvent être vides si le client ne les expose pas.
+//   transfer(cfg, io)  → { dl, up } en octets/s, ou null si le client ne les expose pas.
+//   add(cfg, io, { buf, filename, category, savepath, skipChecking }) → void
+//                        Ajoute un .torrent (Buffer/ArrayBuffer). `savepath` +
+//                        `skipChecking` servent au cross-seed. Throw = échec.
+//
+//   cfg = { ...values de la config, _key } — `_key` identifie (utilisateur, config)
+//         pour les sessions internes du provider (cookies, etc.).
+//   io  = { createError } — fabrique d'erreurs H3 pour des messages propres côté UI.
+
+import qbittorrent from './qbittorrent.mjs'
+import hydra from './hydra.mjs'
+
+export const providers = { [qbittorrent.id]: qbittorrent, [hydra.id]: hydra }
+
+export function getProvider(id, io) {
+  const p = providers[id]
+  if (!p) throw io.createError({ statusCode: 400, statusMessage: `Provider inconnu : ${id}` })
+  return p
+}
+
+/** Métadonnées publiques (pour le formulaire côté client). */
+export function providersMeta() {
+  return Object.values(providers).map((p) => ({ id: p.id, label: p.label, fields: p.fields }))
+}

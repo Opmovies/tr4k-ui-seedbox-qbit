@@ -1,41 +1,14 @@
 {
   "id": "seedbox-qbit",
-  "name": "Seedbox qBittorrent",
-  "version": "1.3.1",
-  "description": "Envoie les torrents vers un qBittorrent distant et affiche l'état de la seedbox.",
+  "name": "Seedbox",
+  "version": "2.0.0",
+  "description": "Envoie les torrents vers ta ou tes seedbox (qBittorrent, Hydra…) : multi-configurations, cross-seed, suivi.",
   "author": "Opmovies",
   "icon": "HardDriveDownload",
   "client": "client.mjs",
   "server": "server.mjs",
   "settings": {
-    "fields": [
-      {
-        "key": "url",
-        "label": "URL du WebUI qBittorrent",
-        "type": "text",
-        "placeholder": "http://ma-seedbox:8080",
-        "required": true,
-        "help": "Adresse du WebUI, accessible depuis ce serveur (pas depuis ton navigateur)."
-      },
-      {
-        "key": "username",
-        "label": "Utilisateur",
-        "type": "text"
-      },
-      {
-        "key": "password",
-        "label": "Mot de passe",
-        "type": "password",
-        "secret": true
-      },
-      {
-        "key": "category",
-        "label": "Catégorie par défaut",
-        "type": "text",
-        "default": "tr4k",
-        "help": "Catégorie qBittorrent appliquée aux torrents envoyés (vide = aucune)."
-      }
-    ]
+    "fields": []
   },
   "slots": [
     "torrent.detail.actions",
