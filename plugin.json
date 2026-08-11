@@ -1,0 +1,57 @@
+{
+  "id": "seedbox-qbit",
+  "name": "Seedbox qBittorrent",
+  "version": "1.3.1",
+  "description": "Envoie les torrents vers un qBittorrent distant et affiche l'état de la seedbox.",
+  "author": "Opmovies",
+  "icon": "HardDriveDownload",
+  "client": "client.mjs",
+  "server": "server.mjs",
+  "settings": {
+    "fields": [
+      {
+        "key": "url",
+        "label": "URL du WebUI qBittorrent",
+        "type": "text",
+        "placeholder": "http://ma-seedbox:8080",
+        "required": true,
+        "help": "Adresse du WebUI, accessible depuis ce serveur (pas depuis ton navigateur)."
+      },
+      {
+        "key": "username",
+        "label": "Utilisateur",
+        "type": "text"
+      },
+      {
+        "key": "password",
+        "label": "Mot de passe",
+        "type": "password",
+        "secret": true
+      },
+      {
+        "key": "category",
+        "label": "Catégorie par défaut",
+        "type": "text",
+        "default": "tr4k",
+        "help": "Catégorie qBittorrent appliquée aux torrents envoyés (vide = aucune)."
+      }
+    ]
+  },
+  "slots": [
+    "torrent.detail.actions",
+    "torrent.row.actions",
+    "torrent.row.badges",
+    "torrent.group.badges",
+    "torrent.detail.badges",
+    "torrent.list.toolbar",
+    "profile.duplicates.actions",
+    "plugin.settings.seedbox-qbit",
+    "nav"
+  ],
+  "permissions": [
+    "server:network",
+    "settings",
+    "tracker:download"
+  ],
+  "repository": "Opmovies/tr4k-ui-seedbox-qbit"
+}
