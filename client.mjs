@@ -291,16 +291,16 @@ export default function setup(api) {
           </label>
 
           <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:2px">
-            <button type="button" class="ghost small" :disabled="busy" title="Teste ce brouillon sans rien enregistrer" @click="test">
+            <button type="button" class="ghost small" :disabled="!!busy" title="Teste ce brouillon sans rien enregistrer" @click="test">
               <span v-if="busy === 'test'" class="spin" /> Tester
             </button>
-            <button type="button" class="ghost small" :disabled="busy" title="Teste puis enregistre si la connexion répond" @click="testAndSave">
+            <button type="button" class="ghost small" :disabled="!!busy" title="Teste puis enregistre si la connexion répond" @click="testAndSave">
               <span v-if="busy === 'testsave'" class="spin" /><IconCheck v-else :size="13" /> Tester et enregistrer
             </button>
-            <button type="submit" class="primary small" :disabled="busy">
+            <button type="submit" class="primary small" :disabled="!!busy">
               <span v-if="busy === 'save'" class="spin" /><IconSave v-else :size="13" /> Enregistrer
             </button>
-            <button type="button" class="ghost small" :disabled="busy" @click="editing = null">Annuler</button>
+            <button type="button" class="ghost small" :disabled="!!busy" @click="editing = null">Annuler</button>
             <span v-if="result" :style="result.ok ? 'color:var(--accent); font-size:12.5px' : 'color:#ff6b6b; font-size:12.5px'">
               {{ result.ok ? '● Connecté' + (result.version ? ' — ' + result.version : '') : '○ ' + result.error }}
             </span>
@@ -402,9 +402,9 @@ export default function setup(api) {
     },
   })
 
-  // ================= page /p/seedbox-qbit : suivi de la seedbox =================
+  // ================= page /p/seedbox-qbit : suivi + cross-seed =================
   const Page = {
-    components: { IconSend },
+    components: { IconSend, IconCross, IconCheck },
     template: `
       <div style="padding-top:16px; display:flex; flex-direction:column; gap:14px">
         <h1 style="margin:0; font-size:19px; display:flex; gap:9px; align-items:center"><IconSend :size="20" /> Seedbox</h1>
@@ -414,6 +414,97 @@ export default function setup(api) {
         </div>
 
         <template v-else>
+          <!-- onglets Suivi / Cross-seed -->
+          <div style="display:flex; gap:8px; flex-wrap:wrap">
+            <button class="chip" :class="{ on: tab === 'suivi' }" @click="tab = 'suivi'">Suivi</button>
+            <button class="chip" :class="{ on: tab === 'cross' }" @click="openCross">
+              Cross-seed<template v-if="crossable"> · {{ crossable }}</template>
+            </button>
+          </div>
+
+          <!-- ============ onglet CROSS-SEED : seedbox → tracker ============ -->
+          <template v-if="tab === 'cross'">
+            <div class="pill-note">
+              Repère les torrents <b>terminés</b> de ta seedbox qui existent aussi sur TR4KER (venus d'un autre
+              tracker) : un clic ajoute la version TR4KER sur les mêmes fichiers — le client vérifie puis seed,
+              sans rien retélécharger.
+            </div>
+
+            <div v-if="scanErr" class="pill-note" style="color:#ff6b6b">○ {{ scanErr }}</div>
+            <div v-else-if="!scan" class="card" style="display:flex; gap:14px; align-items:center">
+              <span class="muted"><span class="spin" /> Analyse de la seedbox…</span>
+            </div>
+
+            <template v-if="scan">
+              <div class="card" style="display:flex; gap:14px; align-items:center; flex-wrap:wrap">
+                <span class="muted" style="font-size:12.5px">
+                  {{ scan.items.length }} torrent(s) hors TR4KER — analysé {{ fmtAgo(scan.scanned_at) }}
+                </span>
+                <span style="flex:1" />
+                <button v-if="countsC.cross" class="primary small" :disabled="scanning || !!bulk" @click="crossAll">
+                  <span v-if="bulk" class="spin" /><IconCross v-else :size="13" />
+                  {{ bulk ? bulk.done + ' / ' + bulk.total + fails(bulk) : 'Tout cross-seeder (' + countsC.cross + ')' }}
+                </button>
+                <button class="ghost small" :disabled="scanning || !!bulk" @click="doScan(true)">
+                  <span v-if="scanning" class="spin" /> Réanalyser
+                </button>
+              </div>
+
+              <div v-for="c in scan.configs.filter((x) => !x.ok)" :key="c.id" class="pill-note" style="color:#ff6b6b">
+                ○ Config « {{ c.name }} » injoignable ({{ c.error }}) — ses torrents ne sont pas dans l'analyse.
+              </div>
+              <div v-if="scan.truncated" class="pill-note">
+                Beaucoup de torrents : seuls les 400 plus récents ont été analysés.
+              </div>
+
+              <!-- filtres par statut -->
+              <div style="display:flex; gap:8px; flex-wrap:wrap">
+                <button v-for="f in FILTERS" :key="f.id" class="chip" :class="{ on: filter === f.id }" @click="filter = f.id">
+                  {{ f.label }} · {{ f.count() }}
+                </button>
+              </div>
+
+              <div class="tablewrap">
+                <table>
+                  <thead><tr><th>Nom</th><th v-if="multiCfg">Config</th><th class="num">Taille</th><th class="num">Seeders TR4KER</th><th style="width:1%"></th></tr></thead>
+                  <tbody>
+                    <tr v-for="t in visible" :key="t.config + t.hash">
+                      <td class="grow" style="font-size:12.5px; max-width:460px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap"
+                          :title="t.name + (t.match && t.match.name !== t.name ? '\\n→ sur TR4KER : ' + t.match.name : '')">{{ t.name }}</td>
+                      <td v-if="multiCfg"><span class="badge">{{ t.config_name }}</span></td>
+                      <td class="num mono">{{ fmtBytes(t.size) }}</td>
+                      <td class="num mono">{{ t.match ? t.match.seeders : '—' }}</td>
+                      <td style="white-space:nowrap">
+                        <button v-if="t.status === 'cross' || t.status === 'near'" class="iconbtn" :disabled="rowBusy[t.config + t.hash] || !!bulk"
+                                :title="t.status === 'near'
+                                  ? 'Taille légèrement différente (' + fmtBytes(t.match.size_bytes) + ' sur TR4KER) : le client retéléchargera les morceaux manquants'
+                                  : 'Cross-seed : ajouter la version TR4KER sur les mêmes fichiers'"
+                                @click="crossOne(t)">
+                          <span v-if="rowBusy[t.config + t.hash]" class="spin" /><IconCross v-else :size="15" />
+                          {{ t.status === 'near' ? 'Cross-seed ≈' : 'Cross-seed' }}
+                        </button>
+                        <span v-else-if="t.status === 'done'" class="badge b-cat" title="La version TR4KER est déjà sur ta seedbox"><IconCheck :size="11" /> seedé</span>
+                        <span v-else-if="t.status === 'same'" class="badge b-cat" title="Ce torrent a le même info_hash que celui du tracker — il seede déjà (ou seederait) sur TR4KER tel quel">identique</span>
+                        <span v-else-if="t.status === 'diff'" class="badge" :title="'Même nom mais ' + fmtBytes(t.match.size_bytes) + ' sur TR4KER : sûrement une autre version'">autre version</span>
+                        <span v-else class="badge" title="Introuvable sur TR4KER — candidat à un futur upload">absent</span>
+                      </td>
+                    </tr>
+                    <tr v-if="!visible.length">
+                      <td :colspan="multiCfg ? 5 : 4" class="empty">
+                        {{ scan.items.length ? 'Rien dans cette catégorie.' : 'Aucun torrent terminé venant d\\'un autre tracker — rien à cross-seeder.' }}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <p v-if="filter === 'absent' && countsC.absent" class="muted" style="margin:0; font-size:12px">
+                Ces releases ne sont pas sur TR4KER : candidates à un upload (fonctionnalité à venir).
+              </p>
+            </template>
+          </template>
+
+          <!-- ============ onglet SUIVI (existant) ============ -->
+          <template v-else>
           <!-- sélecteur de config quand il y en a plusieurs -->
           <div v-if="configs.length > 1" style="display:flex; gap:8px; flex-wrap:wrap">
             <button v-for="c in configs" :key="c.id" class="chip" :class="{ on: c.id === selected }" @click="select(c.id)">
@@ -451,6 +542,7 @@ export default function setup(api) {
               </tbody>
             </table>
           </div>
+          </template>
         </template>
       </div>`,
     setup() {
@@ -461,6 +553,91 @@ export default function setup(api) {
       const configs = ref([])
       const selected = ref('')
       let timer = null
+
+      // ---- onglet cross-seed ----
+      const tab = ref('suivi')
+      const scan = ref(null) // réponse de GET /cross-scan
+      const scanning = ref(false)
+      const scanErr = ref('')
+      const filter = ref('action')
+      const rowBusy = reactive({})
+      const bulk = ref(null) // { done, total, errors } pendant « Tout cross-seeder »
+
+      const countsC = computed(() => {
+        const c = { cross: 0, near: 0, done: 0, same: 0, diff: 0, absent: 0 }
+        for (const t of scan.value?.items || []) c[t.status] = (c[t.status] || 0) + 1
+        return c
+      })
+      const crossable = computed(() => countsC.value.cross + countsC.value.near || 0)
+      const multiCfg = computed(() => (scan.value?.configs || []).length > 1)
+      const FILTERS = [
+        { id: 'action', label: 'À cross-seeder', count: () => countsC.value.cross + countsC.value.near },
+        { id: 'done', label: 'Déjà seedés', count: () => countsC.value.done + countsC.value.same },
+        { id: 'diff', label: 'Autres versions', count: () => countsC.value.diff },
+        { id: 'absent', label: 'Absents du tracker', count: () => countsC.value.absent },
+      ]
+      const GROUPS = { action: ['cross', 'near'], done: ['done', 'same'], diff: ['diff'], absent: ['absent'] }
+      const visible = computed(() => (scan.value?.items || []).filter((t) => GROUPS[filter.value].includes(t.status)))
+
+      async function doScan(refresh) {
+        scanning.value = true
+        scanErr.value = ''
+        try {
+          scan.value = await api.fetch('/cross-scan', { query: refresh ? { refresh: 1 } : {} })
+        } catch (e) {
+          if ((e?.status || e?.statusCode) === 400) configured.value = false
+          scanErr.value = e?.data?.statusMessage || e?.message || 'Erreur inconnue'
+        }
+        scanning.value = false
+      }
+      function openCross() {
+        tab.value = 'cross'
+        if (!scan.value && !scanning.value) doScan(false)
+      }
+
+      // cross-seed d'une ligne — utilisé seul (confirm sur 'near') et par le lot
+      async function crossRaw(t) {
+        const r = await api.fetch('/cross-seed', { method: 'POST', body: { slug: t.match.slug, target_hash: t.hash, config: t.config } })
+        t.status = 'done'
+        return r
+      }
+      async function crossOne(t) {
+        if (t.status === 'near' && !confirm(
+          `La taille diffère légèrement (${fmtBytes(t.size)} sur la seedbox, ${fmtBytes(t.match.size_bytes)} sur TR4KER) : ` +
+          `le client devra retélécharger les morceaux manquants. Continuer ?`)) return
+        rowBusy[t.config + t.hash] = true
+        try {
+          const r = await crossRaw(t)
+          api.ui.toast('Cross-seed lancé', `Ajouté dans ${r.savepath} — le client vérifie les fichiers puis seed`)
+          loadMap()
+        } catch (e) {
+          api.ui.toast('Cross-seed : échec', e?.data?.statusMessage || e?.message || 'Erreur inconnue')
+        }
+        rowBusy[t.config + t.hash] = false
+      }
+      const fails = (b) => (b.errors ? ' (' + b.errors + ' échec' + (b.errors > 1 ? 's' : '') + ')' : '')
+      async function crossAll() {
+        const todo = (scan.value?.items || []).filter((t) => t.status === 'cross') // taille exacte uniquement
+        if (!todo.length) return
+        if (!confirm(`Cross-seeder ${todo.length} torrent(s) ? Chaque ajout télécharge un .torrent sur TR4KER (envois espacés automatiquement).`)) return
+        bulk.value = { done: 0, total: todo.length, errors: 0 }
+        for (const t of todo) {
+          try {
+            await crossRaw(t)
+            bulk.value.done++
+          } catch (e) {
+            bulk.value.errors++
+            if ((e?.status || e?.statusCode) === 429) { // tracker throttlé : inutile d'insister
+              api.ui.toast('Cross-seed interrompu', 'Le tracker throttle (429) — relance « Tout cross-seeder » dans une minute ou deux')
+              break
+            }
+          }
+        }
+        const b = bulk.value
+        api.ui.toast('Cross-seed en masse', `${b.done}/${b.total} lancé(s)${fails(b)}`)
+        bulk.value = null
+        loadMap()
+      }
       async function refresh() {
         loading.value = true
         try {
@@ -490,9 +667,13 @@ export default function setup(api) {
           selected.value = c.defaultConfig
         } catch {}
         refresh()
-        timer = setInterval(refresh, 5000)
+        timer = setInterval(() => { if (tab.value === 'suivi') refresh() }, 5000)
       })
       onUnmounted(() => clearInterval(timer))
+      const fmtAgo = (ts) => {
+        const m = Math.max(0, Math.round((Date.now() - ts) / 60000))
+        return m < 1 ? 'à l’instant' : m < 60 ? `il y a ${m} min` : `il y a ${Math.round(m / 60)} h`
+      }
       const fmtSpeed = (b) => !b ? '—' : b >= 1048576 ? (b / 1048576).toFixed(1) + ' Mo/s' : Math.round(b / 1024) + ' Ko/s'
       const fmtBytes = (b) => !b ? '—' : b >= 1073741824 ? (b / 1073741824).toFixed(2) + ' Go' : (b / 1048576).toFixed(0) + ' Mo'
       const stateLabel = (s) => ({
@@ -502,7 +683,11 @@ export default function setup(api) {
         checkingDL: 'Vérification', checkingUP: 'Vérification', error: 'Erreur', missingFiles: 'Fichiers manquants',
       })[s] || s
       const stateClass = (s) => /error|missing/i.test(s) ? 'b-bad' : /up|seed/i.test(s) ? 'b-cat' : ''
-      return { torrents, status, loading, configured, configs, selected, select, refresh, fmtSpeed, fmtBytes, stateLabel, stateClass }
+      return {
+        torrents, status, loading, configured, configs, selected, select, refresh, fmtSpeed, fmtBytes, stateLabel, stateClass,
+        tab, scan, scanning, scanErr, filter, rowBusy, bulk, countsC, crossable, multiCfg, FILTERS, visible,
+        doScan, openCross, crossOne, crossAll, fails, fmtAgo,
+      }
     },
   }
   api.ui.registerPage({ path: '/p/seedbox-qbit', component: Page, title: 'Seedbox', icon: 'HardDriveDownload', order: 40 })

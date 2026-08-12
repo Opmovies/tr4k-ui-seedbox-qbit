@@ -28,7 +28,10 @@ function getStore(ctx) {
   return { configs: [], defaultConfig: '' }
 }
 
-const saveStore = (ctx, store) => ctx.saveSettings({ configs: store.configs, defaultConfig: store.defaultConfig })
+const saveStore = (ctx, store) => {
+  ctx.saveSettings({ configs: store.configs, defaultConfig: store.defaultConfig })
+  scanCache.delete(ctx.userKey) // une config ajoutée/retirée change les candidats du scan
+}
 
 function maskConfig(c) {
   const p = providers[c.provider]
@@ -85,6 +88,35 @@ async function pushTorrent(ctx, c, slug, { savepath, skipChecking } = {}) {
     skipChecking,
   })
   invalidate(ctx, c)
+  scanCache.delete(ctx.userKey) // l'inventaire change → le scan cross-seed est périmé
+}
+
+// ================= scan cross-seed : seedbox → tracker =================
+// Compare les torrents TERMINÉS des configs (hors ceux qui annoncent déjà TR4KER)
+// au catalogue du tracker via POST /api/migrations/match : matching PAR LOT, une
+// ligne = un nom de release OU un info_hash (casse ignorée, séparateurs NON — on
+// envoie les noms tels quels). Une requête couvre ~40 torrents, indispensable avec
+// le budget 20 req/min de l'hôte. Statuts calculés ici, affichés par la page :
+//   'done'   la version TR4KER du match est déjà sur la seedbox (hash présent)
+//   'same'   le match a le MÊME info_hash que le candidat → rien à cross-seeder
+//   'cross'  même release, taille identique à l'octet → cross-seed 1 clic
+//   'near'   taille ±2 % → cross-seed possible mais re-téléchargement partiel
+//   'diff'   même nom mais taille trop éloignée → probablement une autre version
+//   'absent' introuvable sur le tracker (candidat à un futur upload)
+
+const SCAN_TTL = 10 * 60_000
+const SCAN_MAX = 400 // au-delà : les plus récents seulement, signalé par `truncated`
+const scanCache = new Map() // userKey -> { at, data }
+
+const isTr4kTracker = (url) => /tr4ker/i.test(url || '')
+
+async function matchBatch(ctx, lines) {
+  const out = new Map() // ligne envoyée -> torrent TR4KER | null
+  for (let i = 0; i < lines.length; i += 80) {
+    const res = await ctx.lib.tr4kMutate('POST', 'migrations/match', ctx.auth, { text: lines.slice(i, i + 80).join('\n') })
+    for (const r of res?.results || []) out.set(r.query, r.torrent || null)
+  }
+  return out
 }
 
 export const routes = {
@@ -192,6 +224,70 @@ export const routes = {
       .sort((a, b) => (b.added_on || 0) - (a.added_on || 0))
       .slice(0, 200)
     return { config: { id: c.id, name: c.name, provider: c.provider }, transfer, torrents }
+  },
+
+  // scan cross-seed (voir bloc de doc plus haut) — cache 10 min par user, ?refresh=1 force
+  'GET /cross-scan': async (event, ctx) => {
+    const store = getStore(ctx)
+    if (!store.configs.length)
+      throw ctx.h3.createError({ statusCode: 400, statusMessage: 'Seedbox non configurée (aucune configuration)' })
+    const cached = scanCache.get(ctx.userKey)
+    if (!ctx.query?.refresh && cached && Date.now() - cached.at < SCAN_TTL) return { ...cached.data, cache: true }
+
+    // 1) inventaire agrégé — une config injoignable n'empêche pas les autres
+    const entries = []
+    const configsOut = []
+    const allHashes = new Set()
+    for (const c of store.configs) {
+      try {
+        const list = await cachedList(ctx, c)
+        configsOut.push({ id: c.id, name: c.name, ok: true })
+        for (const t of list) {
+          if (t.hash) allHashes.add(t.hash)
+          entries.push({ ...t, config: c.id, config_name: c.name })
+        }
+      } catch (e) {
+        configsOut.push({ id: c.id, name: c.name, ok: false, error: e?.statusMessage || e?.message || 'injoignable' })
+      }
+    }
+    if (!configsOut.some((x) => x.ok))
+      throw ctx.h3.createError({ statusCode: 502, statusMessage: `Aucune seedbox joignable (${configsOut[0]?.error || '?'})` })
+
+    // 2) candidats : terminés, n'annonçant pas (ou plus) TR4KER — les torrents TR4KER
+    // au tracker en erreur (champ vide) passent ici puis ressortent en 'same' via le hash
+    let candidates = entries.filter((t) => (t.progress ?? 0) >= 0.999 && !isTr4kTracker(t.tracker))
+    candidates.sort((a, b) => (b.added_on || 0) - (a.added_on || 0))
+    const truncated = candidates.length > SCAN_MAX
+    if (truncated) candidates = candidates.slice(0, SCAN_MAX)
+
+    // 3) matching par lot (nom + hash par candidat, lignes dédupliquées)
+    const lines = [...new Set(candidates.flatMap((t) => [String(t.name || '').trim(), t.hash].filter(Boolean)))]
+    const matches = lines.length ? await matchBatch(ctx, lines) : new Map()
+
+    // 4) classement
+    const items = candidates.map((t) => {
+      const m = matches.get(String(t.name || '').trim()) || matches.get(t.hash) || null
+      let status = 'absent'
+      if (m) {
+        if (m.info_hash === t.hash) status = 'same'
+        else if (allHashes.has(m.info_hash)) status = 'done'
+        else if (m.size_bytes === t.size) status = 'cross'
+        else if (Math.abs((m.size_bytes || 0) - (t.size || 0)) / Math.max(m.size_bytes || 1, t.size || 1) <= 0.02) status = 'near'
+        else status = 'diff'
+      }
+      return {
+        hash: t.hash, name: t.name, size: t.size, added_on: t.added_on,
+        config: t.config, config_name: t.config_name, status,
+        match: m ? { slug: m.slug, name: m.name, size_bytes: m.size_bytes, seeders: m.seeders } : null,
+      }
+    })
+
+    const counts = {}
+    for (const i of items) counts[i.status] = (counts[i.status] || 0) + 1
+    const data = { scanned_at: Date.now(), configs: configsOut, truncated, counts, items }
+    scanCache.set(ctx.userKey, { at: Date.now(), data })
+    ctx.log(`cross-scan : ${items.length} candidat(s), ${counts.cross || 0} cross-seedable(s)`)
+    return data
   },
 
   // envoie un torrent du tracker vers une config : .torrent téléchargé côté serveur

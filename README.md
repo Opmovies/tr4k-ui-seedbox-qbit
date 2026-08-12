@@ -55,9 +55,27 @@ dans le registre. Ni `server.mjs` ni `client.mjs` n'ont besoin de changer.
 
 - Envoi d'un torrent vers la seedbox par défaut depuis la fiche torrent, la liste ou les doublons du profil
 - Cross-seed vers la seedbox qui possède déjà la release (autre tracker, mêmes fichiers)
+- **Onglet Cross-seed** (v2.1) : scan inverse seedbox → tracker (voir ci-dessous)
 - Badges d'état (présent sur une seedbox, progression) sur les lignes, groupes et fiches — agrégés sur toutes les configs
 - Page de suivi avec sélecteur de seedbox (torrents actifs, débits quand le client les expose)
 - Filtre « Masquer seedbox » dans la barre d'outils de la liste
+
+### Onglet Cross-seed (seedbox → tracker)
+
+La page `/p/seedbox-qbit` analyse les torrents **terminés** de toutes les configs qui
+n'annoncent pas sur TR4KER et les compare au catalogue du tracker (matching **par lot**
+via `POST /api/migrations/match` — une requête pour ~40 torrents, nom de release +
+info_hash). Chaque torrent ressort dans l'une de ces catégories :
+
+| Statut | Sens | Action |
+|---|---|---|
+| À cross-seeder | La release existe sur TR4KER, taille identique à l'octet (ou ±2 % marqué « ≈ ») | **Cross-seed** en 1 clic, ou « Tout cross-seeder » (envois espacés, s'arrête proprement sur un 429) |
+| Déjà seedés | La version TR4KER est déjà sur la seedbox, ou même info_hash | — |
+| Autres versions | Même nom mais taille trop différente | — |
+| Absents du tracker | Introuvables sur TR4KER | candidats à un futur upload |
+
+Le résultat est mis en cache 10 min côté serveur (« Réanalyser » force). Au-delà de
+400 candidats, seuls les plus récents sont analysés (signalé dans l'UI).
 
 ## Structure
 
