@@ -6,6 +6,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { providers, getProvider, providersMeta } from './providers/index.mjs'
+import { rebuildTorrent } from './bencode.mjs'
 
 const SENTINEL = '••••' // même sentinelle que l'hôte : reçue = « valeur inchangée »
 
@@ -117,6 +118,87 @@ async function matchBatch(ctx, lines) {
     for (const r of res?.results || []) out.set(r.query, r.torrent || null)
   }
   return out
+}
+
+// ================= upload assisté : torrent absent du tracker =================
+// prepare : exporte le .torrent depuis le client (qBittorrent ≥ 4.5), le reconstruit
+// pour TR4KER (private=1 + source=TR4KER → nouvel info_hash), preflight anti-doublon
+// sur les DEUX hash (le reconstruit ET l'original — les migrations gardent le hash
+// d'origine), et renvoie tout le pré-rempli (release parsée, catégories, TMDB).
+// commit : POST /api/torrents multipart (mêmes champs que le flux d'import du site,
+// contrat relevé dans tr4ker_upload.py), puis remet le .torrent TR4KER en seed sur
+// la seedbox (savepath d'origine, le client vérifie les fichiers).
+
+const preparedUploads = new Map() // `${userKey}:${infoHash}` -> { at, prep, configId }
+const PREP_TTL = 20 * 60_000
+
+const RX = {
+  res: /\b(2160p|1080p|720p|576p|480p|4K|UHD)\b/i,
+  src: /\b(UHD\.?BluRay|BluRay|BDRip|BRRip|HDLight|WEB-?DL|WEBRip|WEB|HDRip|DVDRip|DVD|HDTV|REMUX)\b/i,
+  vid: /\b(x264|x265|H\.?264|H\.?265|HEVC|AV1|XviD|VP9)\b/i,
+  aud: /\b(TrueHD(?:\.?Atmos)?|E-?AC-?3(?:\.?Atmos)?|DTS(?:[-.]?HD)?(?:\.?MA)?|AC-?3|EAC3|AAC|FLAC|Opus|PCM|MP3)\b/i,
+  lang: /\b(MULTI|TRUEFRENCH|FRENCH|VOSTFR|SUBFRENCH|VFF|VFQ|VFI|VF|VO|ENGLISH)\b/i,
+  year: /\b(19\d{2}|20\d{2})\b/,
+  ep: /\bS(\d{1,2})(?:E(\d{1,3}))?\b/i,
+  group: /-([A-Za-z0-9]+)$/,
+}
+
+function parseRelease(name) {
+  const base = String(name || '').replace(/\.(mkv|mp4|avi|iso|epub|pdf|mobi|azw3?|cbz|cbr|mp3|flac|m4a|opus|ogg|wav)$/i, '')
+  const pick = (rx) => (base.match(rx) || [''])[0]
+  const ep = base.match(RX.ep)
+  const d = {
+    resolution: pick(RX.res), source: pick(RX.src), video: pick(RX.vid), audio: pick(RX.aud),
+    lang: pick(RX.lang), year: pick(RX.year),
+    season: ep ? ep[1] : '', episode: ep && ep[2] ? ep[2] : '',
+    group: (base.match(RX.group) || ['', ''])[1],
+  }
+  // titre = tout ce qui précède le premier marqueur technique (SxxEyy / année / résolution / source)
+  let cut = base
+  for (const rx of [RX.ep, RX.year, RX.res, RX.src]) {
+    const m = cut.match(rx)
+    if (m) { cut = cut.slice(0, m.index); break }
+  }
+  d.title = cut.replace(/[._]/g, ' ').replace(/\s*[[(].*/, '').replace(/[ \-–·]+$/g, '').trim()
+  return d
+}
+
+/** Slug de catégorie PARENTE probable (les catégories du site sont une liste plate id/slug/parent_id). */
+function guessCategory(rel, cats) {
+  const parents = new Set((cats || []).filter((c) => !c.parent_id).map((c) => c.slug))
+  const has = (s) => parents.has(s) ? s : ''
+  if (rel.season) return has('series')
+  if (rel.resolution || rel.source) return has('films')
+  return ''
+}
+
+const humanSize = (n) => n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' Go' : (n / 1048576).toFixed(0) + ' Mo'
+
+/** Présentation BBCode par défaut — garantit de ne jamais uploader une description vide. */
+function defaultPresentation(prep, rel) {
+  const rows = [
+    ['Qualité', rel.resolution], ['Source', rel.source], ['Codec', rel.video],
+    ['Audio', rel.audio], ['Langue', rel.lang], ['Taille', humanSize(prep.size)],
+    ['Fichiers', String(prep.files.length)],
+  ].filter(([, v]) => String(v || '').trim())
+  const list = rows.length ? ['[b]Fiche technique[/b]', '[list]', ...rows.map(([k, v]) => `[*][b]${k}[/b] : ${v}`), '[/list]'] : []
+  return [`[center][b]${prep.name}[/b][/center]`, '', ...list].join('\n')
+}
+
+/** Announce TR4KER de l'utilisateur (embarque son passkey) — exposé par le feed /api/ygg. */
+async function getAnnounce(ctx) {
+  const r = await ctx.lib.tr4kGet('ygg', { per: 1 }, ctx.auth)
+  const a = r?.data?.announce_url
+  if (!a || !/^https?:\/\//.test(a)) throw ctx.h3.createError({ statusCode: 502, statusMessage: 'Announce TR4KER introuvable (feed ygg muet)' })
+  return a
+}
+
+async function preflight(ctx, infoHash, title) {
+  try {
+    return await ctx.lib.tr4kMutate('POST', 'torrents/preflight', ctx.auth, { info_hash: infoHash, title, nfo: '' })
+  } catch (e) {
+    return { error: e?.statusMessage || e?.message || 'preflight en échec' }
+  }
 }
 
 export const routes = {
@@ -288,6 +370,129 @@ export const routes = {
     scanCache.set(ctx.userKey, { at: Date.now(), data })
     ctx.log(`cross-scan : ${items.length} candidat(s), ${counts.cross || 0} cross-seedable(s)`)
     return data
+  },
+
+  // ---- upload assisté (voir bloc de doc plus haut) ----
+
+  'POST /upload/prepare': async (event, ctx) => {
+    const hash = String(ctx.body?.hash || '').trim().toLowerCase()
+    if (!/^[a-f0-9]{40}$/.test(hash)) throw ctx.h3.createError({ statusCode: 400, statusMessage: 'hash requis' })
+    const c = pickConfig(ctx, String(ctx.body?.config || '') || undefined)
+    const provider = getProvider(c.provider, io(ctx))
+    if (typeof provider.export !== 'function')
+      throw ctx.h3.createError({ statusCode: 400, statusMessage: `Le client « ${provider.label} » ne sait pas exporter un .torrent` })
+    const t = (await cachedList(ctx, c)).find((x) => x.hash === hash)
+    if (!t) throw ctx.h3.createError({ statusCode: 404, statusMessage: 'Torrent introuvable sur la seedbox' })
+    if ((t.progress ?? 0) < 0.999)
+      throw ctx.h3.createError({ statusCode: 400, statusMessage: 'Torrent incomplet — impossible de l’uploader' })
+
+    const raw = await provider.export(cfgFor(ctx, c), io(ctx), hash)
+    const announce = await getAnnounce(ctx)
+    const prep = rebuildTorrent(raw, announce)
+    prep.save_path = t.save_path || ''
+
+    // doublon ? les DEUX hash comptent (reconstruit + original, cf. bloc de doc)
+    const [preNew, preOrig] = [await preflight(ctx, prep.infoHash, prep.name), await preflight(ctx, prep.originalHash, prep.name)]
+    const existing = preOrig?.hash_conflict || preNew?.hash_conflict || null
+
+    const rel = parseRelease(prep.name)
+    let cats = []
+    try { cats = (await ctx.lib.tr4kGet('public/categories', {}, ctx.auth)).data || [] } catch {}
+    let tmdb = []
+    if (rel.title) {
+      try {
+        const r = await ctx.lib.tr4kGet('tmdb/suggest', { q: rel.title }, ctx.auth)
+        tmdb = (r?.data?.results || []).slice(0, 5)
+      } catch {}
+    }
+
+    preparedUploads.set(`${ctx.userKey}:${prep.infoHash}`, { at: Date.now(), prep, configId: c.id })
+    for (const [k, v] of preparedUploads) if (Date.now() - v.at > PREP_TTL) preparedUploads.delete(k)
+
+    return {
+      info_hash: prep.infoHash, original_hash: prep.originalHash,
+      name: prep.name, size: prep.size, file_count: prep.files.length,
+      save_path: prep.save_path, config: c.id,
+      release: rel, existing, // {slug, name…} si le FICHIER est déjà sur TR4KER
+      categories: cats.map((x) => ({ id: x.id, slug: x.slug, name: x.name, parent_id: x.parent_id || null })),
+      category_guess: guessCategory(rel, cats),
+      tmdb, tmdb_type: rel.season ? 'tv' : 'movie',
+      presentation: defaultPresentation(prep, rel),
+    }
+  },
+
+  'POST /upload/commit': async (event, ctx) => {
+    if (typeof ctx.lib.tr4kMultipart !== 'function')
+      throw ctx.h3.createError({ statusCode: 501, statusMessage: 'Hôte trop ancien pour l’upload — mets TR4K UI à jour (≥ 1.5.6)' })
+    const infoHash = String(ctx.body?.info_hash || '').trim().toLowerCase()
+    const hit = preparedUploads.get(`${ctx.userKey}:${infoHash}`)
+    if (!hit || Date.now() - hit.at > PREP_TTL)
+      throw ctx.h3.createError({ statusCode: 410, statusMessage: 'Préparation expirée — rouvre la fenêtre d’upload' })
+    const { prep, configId } = hit
+    const f = ctx.body?.form || {}
+    const name = String(f.name || prep.name).trim()
+    const catSlug = String(f.category_slug || '').trim()
+    if (!catSlug) throw ctx.h3.createError({ statusCode: 400, statusMessage: 'Catégorie requise' })
+
+    const rel = parseRelease(prep.name)
+    const pres = String(f.presentation || '').trim() || defaultPresentation(prep, rel)
+    const nfo = String(f.nfo || '')
+    const tags = String(f.tags || '').split(',').map((s) => s.trim()).filter(Boolean)
+    const fields = {
+      info_hash: prep.infoHash,
+      original_hash: prep.originalHash,
+      name,
+      nfo,
+      mediainfo: nfo, // même doublage que le flux d'import du site
+      size_bytes: String(prep.size),
+      file_count: String(prep.files.length),
+      piece_length: String(prep.pieceLength),
+      category_slug: catSlug,
+      tags: JSON.stringify(tags),
+      description: String(f.description || '').trim(),
+      tech_info_xml: '',
+      extra_info: pres,
+      extra_info_format: 'bbcode',
+      classic_description: pres, // c'est CE champ que le site persiste comme description
+      classic_description_format: 'bbcode',
+      is_anonymous: f.is_anonymous ? 'true' : 'false',
+      is_exclusive: 'false',
+      files: JSON.stringify(prep.files),
+    }
+    if (f.subcategory_slug) fields.subcategory_slug = String(f.subcategory_slug)
+    if (f.tmdb_id) {
+      fields.tmdb_id = String(f.tmdb_id)
+      fields.tmdb_type = String(f.tmdb_type || 'movie')
+    }
+    if (f.poster_url) fields.poster_url = String(f.poster_url)
+    if (f.year || rel.year) fields.year = String(f.year || rel.year)
+
+    const res = await ctx.lib.tr4kMultipart('torrents', {
+      fields,
+      file: { field: 'torrent', name: `${prep.name}.torrent`, data: prep.bytes },
+    }, ctx.auth)
+
+    // remet la version TR4KER en seed sur les fichiers d'origine (le client vérifie)
+    let seeded = false
+    if (f.seed_after !== false && prep.save_path) {
+      try {
+        const c = pickConfig(ctx, configId)
+        await getProvider(c.provider, io(ctx)).add(cfgFor(ctx, c), io(ctx), {
+          buf: prep.bytes,
+          filename: `${prep.name}.torrent`,
+          category: c.values.category || '',
+          savepath: prep.save_path,
+        })
+        invalidate(ctx, c)
+        seeded = true
+      } catch (e) {
+        ctx.log(`upload ${name} : mise en seed ratée (${e?.statusMessage || e?.message})`)
+      }
+    }
+    preparedUploads.delete(`${ctx.userKey}:${infoHash}`)
+    scanCache.delete(ctx.userKey)
+    ctx.log(`upload « ${name} » envoyé au tracker (cat ${catSlug}${seeded ? ', remis en seed' : ''})`)
+    return { ok: true, slug: res?.slug || res?.torrent?.slug || null, seeded, response: res }
   },
 
   // envoie un torrent du tracker vers une config : .torrent téléchargé côté serveur

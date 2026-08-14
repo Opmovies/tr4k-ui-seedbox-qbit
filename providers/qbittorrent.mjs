@@ -147,6 +147,14 @@ export default {
     return { dl: info.dl_info_speed ?? 0, up: info.up_info_speed ?? 0 }
   },
 
+  // .torrent d'un torrent présent (pour l'upload vers TR4KER) — qBittorrent ≥ 4.5
+  async export(cfg, io, hash) {
+    const res = await qbit(cfg, io, `/torrents/export?hash=${encodeURIComponent(hash)}`)
+    if (res.status === 404) throw io.createError({ statusCode: 502, statusMessage: 'torrents/export indisponible — qBittorrent ≥ 4.5 requis' })
+    if (!res.ok) throw io.createError({ statusCode: 502, statusMessage: `qBittorrent a répondu ${res.status} sur /torrents/export` })
+    return new Uint8Array(await res.arrayBuffer())
+  },
+
   async add(cfg, io, { buf, filename, category, savepath, skipChecking }) {
     const fields = { category: category || '' }
     if (savepath) {

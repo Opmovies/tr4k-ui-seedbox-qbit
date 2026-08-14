@@ -20,6 +20,9 @@
 //   add(cfg, io, { buf, filename, category, savepath, skipChecking }) → void
 //                        Ajoute un .torrent (Buffer/ArrayBuffer). `savepath` +
 //                        `skipChecking` servent au cross-seed. Throw = échec.
+//   export?(cfg, io, hash) → Uint8Array — OPTIONNEL : octets du .torrent d'un torrent
+//                        présent (nécessaire à l'upload vers TR4KER ; absent = upload
+//                        masqué pour les configs de ce provider).
 //
 //   cfg = { ...values de la config, _key } — `_key` identifie (utilisateur, config)
 //         pour les sessions internes du provider (cookies, etc.).
@@ -38,5 +41,5 @@ export function getProvider(id, io) {
 
 /** Métadonnées publiques (pour le formulaire côté client). */
 export function providersMeta() {
-  return Object.values(providers).map((p) => ({ id: p.id, label: p.label, fields: p.fields }))
+  return Object.values(providers).map((p) => ({ id: p.id, label: p.label, fields: p.fields, canExport: typeof p.export === 'function' }))
 }

@@ -402,9 +402,10 @@ export default function setup(api) {
     },
   })
 
-  // ================= page /p/seedbox-qbit : suivi + cross-seed =================
+  // ================= page /p/seedbox-qbit : suivi + cross-seed + upload =================
+  const IconUp = api.ui.icons.Upload
   const Page = {
-    components: { IconSend, IconCross, IconCheck },
+    components: { IconSend, IconCross, IconCheck, IconUp },
     template: `
       <div style="padding-top:16px; display:flex; flex-direction:column; gap:14px">
         <h1 style="margin:0; font-size:19px; display:flex; gap:9px; align-items:center"><IconSend :size="20" /> Seedbox</h1>
@@ -486,7 +487,12 @@ export default function setup(api) {
                         <span v-else-if="t.status === 'done'" class="badge b-cat" title="La version TR4KER est déjà sur ta seedbox"><IconCheck :size="11" /> seedé</span>
                         <span v-else-if="t.status === 'same'" class="badge b-cat" title="Ce torrent a le même info_hash que celui du tracker — il seede déjà (ou seederait) sur TR4KER tel quel">identique</span>
                         <span v-else-if="t.status === 'diff'" class="badge" :title="'Même nom mais ' + fmtBytes(t.match.size_bytes) + ' sur TR4KER : sûrement une autre version'">autre version</span>
-                        <span v-else class="badge" title="Introuvable sur TR4KER — candidat à un futur upload">absent</span>
+                        <span v-else-if="t.status === 'uploaded'" class="badge b-cat" title="Uploadé sur TR4KER — en attente de validation par le staff">uploadé ✓</span>
+                        <button v-else class="iconbtn" :disabled="!!bulk"
+                                title="Cette release est introuvable sur TR4KER : l'uploader (formulaire pré-rempli, .torrent reconstruit automatiquement)"
+                                @click="openUpload(t)">
+                          <IconUp :size="15" /> Uploader
+                        </button>
                       </td>
                     </tr>
                     <tr v-if="!visible.length">
@@ -498,9 +504,109 @@ export default function setup(api) {
                 </table>
               </div>
               <p v-if="filter === 'absent' && countsC.absent" class="muted" style="margin:0; font-size:12px">
-                Ces releases ne sont pas sur TR4KER : candidates à un upload (fonctionnalité à venir).
+                Ces releases ne sont pas sur TR4KER : le bouton Uploader reconstruit le .torrent
+                (private + source TR4KER), pré-remplit la fiche et remet le torrent en seed après l'envoi.
               </p>
             </template>
+
+            <!-- ============ modale d'upload ============ -->
+            <div v-if="up" style="position:fixed; inset:0; z-index:90; background:rgba(0,0,0,.55); display:flex; align-items:flex-start; justify-content:center; overflow:auto; padding:30px 14px"
+                 @click.self="up = null">
+              <div class="card" style="width:min(640px, 100%); display:flex; flex-direction:column; gap:12px">
+                <b style="font-size:15px; display:flex; gap:8px; align-items:center"><IconUp :size="16" /> Uploader sur TR4KER</b>
+                <div class="mono muted" style="font-size:11.5px; word-break:break-all">{{ up.item.name }}</div>
+
+                <div v-if="up.loading" class="empty"><span class="spin" /> Préparation (.torrent exporté et reconstruit)…</div>
+                <div v-else-if="up.err" class="pill-note" style="color:#ff6b6b">○ {{ up.err }}</div>
+
+                <template v-else-if="up.done">
+                  <div class="pill-note">
+                    ✓ Uploadé — le torrent est <b>en attente de validation</b> par le staff.
+                    <template v-if="up.result.seeded"> Il a été remis en seed sur la seedbox.</template>
+                  </div>
+                  <div style="display:flex; gap:10px">
+                    <button v-if="up.result.slug" class="primary small" @click="goFiche(up.result.slug)">Voir la fiche</button>
+                    <button class="ghost small" @click="up = null">Fermer</button>
+                  </div>
+                </template>
+
+                <template v-else-if="up.prep">
+                  <div v-if="up.prep.existing" class="pill-note" style="color:var(--accent)">
+                    Ce FICHIER est déjà sur TR4KER (« {{ up.prep.existing.name || up.prep.existing.slug }} ») —
+                    inutile d'uploader un doublon : cross-seede la version existante.
+                    <button class="ghost small" style="margin-left:8px" :disabled="up.busy" @click="crossExisting">
+                      <span v-if="up.busy" class="spin" /><IconCross v-else :size="13" /> Cross-seed
+                    </button>
+                  </div>
+
+                  <form v-else style="display:flex; flex-direction:column; gap:11px" @submit.prevent="submitUpload">
+                    <label style="display:flex; flex-direction:column; gap:5px">
+                      <span style="font-size:12px">Nom de la release *</span>
+                      <input v-model="up.form.name" type="text" required />
+                    </label>
+                    <div style="display:flex; gap:10px; flex-wrap:wrap">
+                      <label style="display:flex; flex-direction:column; gap:5px; flex:1; min-width:170px">
+                        <span style="font-size:12px">Catégorie *</span>
+                        <select v-model="up.form.category_slug" required>
+                          <option value="" disabled>— choisir —</option>
+                          <option v-for="c in parentCats" :key="c.slug" :value="c.slug">{{ c.name }}</option>
+                        </select>
+                      </label>
+                      <label style="display:flex; flex-direction:column; gap:5px; flex:1; min-width:170px">
+                        <span style="font-size:12px">Sous-catégorie</span>
+                        <select v-model="up.form.subcategory_slug">
+                          <option value="">—</option>
+                          <option v-for="c in subCats" :key="c.slug" :value="c.slug">{{ c.name }}</option>
+                        </select>
+                      </label>
+                      <label style="display:flex; flex-direction:column; gap:5px; width:110px">
+                        <span style="font-size:12px">Année</span>
+                        <input v-model="up.form.year" type="text" inputmode="numeric" />
+                      </label>
+                    </div>
+
+                    <div v-if="up.prep.tmdb.length" style="display:flex; flex-direction:column; gap:6px">
+                      <span style="font-size:12px">Œuvre TMDB (pose l'affiche et la fiche)</span>
+                      <div style="display:flex; gap:8px; flex-wrap:wrap">
+                        <button v-for="r in up.prep.tmdb" :key="r.id" type="button" class="chip" :class="{ on: up.form.tmdb_id === r.id }"
+                                @click="pickTmdb(r)">
+                          {{ r.title }}<template v-if="r.year"> ({{ r.year }})</template>
+                        </button>
+                        <button type="button" class="chip" :class="{ on: !up.form.tmdb_id }" @click="pickTmdb(null)">Aucune</button>
+                      </div>
+                    </div>
+
+                    <label style="display:flex; flex-direction:column; gap:5px">
+                      <span style="font-size:12px">Tags (séparés par des virgules)</span>
+                      <input v-model="up.form.tags" type="text" :placeholder="tagHint" />
+                    </label>
+                    <label style="display:flex; flex-direction:column; gap:5px">
+                      <span style="font-size:12px">Présentation (BBCode)</span>
+                      <textarea v-model="up.form.presentation" rows="6" class="mono" style="font-size:12px" />
+                    </label>
+                    <label style="display:flex; flex-direction:column; gap:5px">
+                      <span style="font-size:12px">NFO / MediaInfo (optionnel mais apprécié du staff)</span>
+                      <textarea v-model="up.form.nfo" rows="3" class="mono" style="font-size:12px" placeholder="Colle ici la sortie mediainfo si tu l'as" />
+                    </label>
+                    <div style="display:flex; gap:16px; flex-wrap:wrap">
+                      <label class="sw" :class="{ on: up.form.seed_after }" @click="up.form.seed_after = !up.form.seed_after">
+                        <span class="track" /> Remettre en seed après l'upload
+                      </label>
+                      <label class="sw" :class="{ on: up.form.is_anonymous }" @click="up.form.is_anonymous = !up.form.is_anonymous">
+                        <span class="track" /> Upload anonyme
+                      </label>
+                    </div>
+                    <div style="display:flex; gap:10px; align-items:center">
+                      <button type="submit" class="primary small" :disabled="up.busy">
+                        <span v-if="up.busy" class="spin" /><IconUp v-else :size="13" /> Uploader sur TR4KER
+                      </button>
+                      <button type="button" class="ghost small" :disabled="up.busy" @click="up = null">Annuler</button>
+                      <span class="muted mono" style="font-size:11px; margin-left:auto">{{ fmtBytes(up.prep.size) }} · {{ up.prep.file_count }} fichier(s)</span>
+                    </div>
+                  </form>
+                </template>
+              </div>
+            </div>
           </template>
 
           <!-- ============ onglet SUIVI (existant) ============ -->
@@ -564,7 +670,7 @@ export default function setup(api) {
       const bulk = ref(null) // { done, total, errors } pendant « Tout cross-seeder »
 
       const countsC = computed(() => {
-        const c = { cross: 0, near: 0, done: 0, same: 0, diff: 0, absent: 0 }
+        const c = { cross: 0, near: 0, done: 0, same: 0, diff: 0, absent: 0, uploaded: 0 }
         for (const t of scan.value?.items || []) c[t.status] = (c[t.status] || 0) + 1
         return c
       })
@@ -574,9 +680,9 @@ export default function setup(api) {
         { id: 'action', label: 'À cross-seeder', count: () => countsC.value.cross + countsC.value.near },
         { id: 'done', label: 'Déjà seedés', count: () => countsC.value.done + countsC.value.same },
         { id: 'diff', label: 'Autres versions', count: () => countsC.value.diff },
-        { id: 'absent', label: 'Absents du tracker', count: () => countsC.value.absent },
+        { id: 'absent', label: 'Absents du tracker', count: () => countsC.value.absent + countsC.value.uploaded },
       ]
-      const GROUPS = { action: ['cross', 'near'], done: ['done', 'same'], diff: ['diff'], absent: ['absent'] }
+      const GROUPS = { action: ['cross', 'near'], done: ['done', 'same'], diff: ['diff'], absent: ['absent', 'uploaded'] }
       const visible = computed(() => (scan.value?.items || []).filter((t) => GROUPS[filter.value].includes(t.status)))
 
       async function doScan(refresh) {
@@ -615,6 +721,82 @@ export default function setup(api) {
         }
         rowBusy[t.config + t.hash] = false
       }
+      // ---- upload assisté ----
+      const up = ref(null) // { item, loading, err, prep, form, busy, done, result }
+
+      const parentCats = computed(() => (up.value?.prep?.categories || []).filter((c) => !c.parent_id))
+      const subCats = computed(() => {
+        const cats = up.value?.prep?.categories || []
+        const parent = cats.find((c) => c.slug === up.value?.form?.category_slug && !c.parent_id)
+        return parent ? cats.filter((c) => c.parent_id === parent.id) : []
+      })
+      const tagHint = computed(() => {
+        const r = up.value?.prep?.release || {}
+        return [r.resolution, r.lang, r.video].filter(Boolean).join(', ')
+      })
+
+      async function openUpload(item) {
+        up.value = { item, loading: true, err: '', prep: null, form: null, busy: false, done: false, result: null }
+        try {
+          const prep = await api.fetch('/upload/prepare', { method: 'POST', body: { hash: item.hash, config: item.config } })
+          const rel = prep.release || {}
+          up.value.prep = prep
+          up.value.form = reactive({
+            name: prep.name,
+            category_slug: prep.category_guess || '',
+            subcategory_slug: '',
+            year: rel.year || '',
+            tmdb_id: prep.tmdb[0]?.id || 0,
+            tmdb_type: prep.tmdb_type,
+            poster_url: prep.tmdb[0]?.poster_url || '',
+            tags: [rel.resolution, rel.lang].filter(Boolean).join(', '),
+            presentation: prep.presentation,
+            nfo: '',
+            description: '',
+            is_anonymous: false,
+            seed_after: true,
+          })
+        } catch (e) {
+          up.value.err = e?.data?.statusMessage || e?.message || 'Erreur inconnue'
+        }
+        up.value.loading = false
+      }
+      function pickTmdb(r) {
+        up.value.form.tmdb_id = r?.id || 0
+        up.value.form.poster_url = r?.poster_url || ''
+        if (r?.year && !up.value.form.year) up.value.form.year = String(r.year)
+      }
+      async function submitUpload() {
+        const u = up.value
+        u.busy = true
+        try {
+          u.result = await api.fetch('/upload/commit', { method: 'POST', body: { info_hash: u.prep.info_hash, form: { ...u.form } } })
+          u.done = true
+          u.item.status = 'uploaded'
+          api.ui.toast('Upload envoyé', `« ${u.form.name} » est en attente de validation${u.result.seeded ? ' et remis en seed' : ''}`)
+          loadMap()
+        } catch (e) {
+          api.ui.toast('Upload : échec', e?.data?.statusMessage || e?.message || 'Erreur inconnue')
+        }
+        u.busy = false
+      }
+      // le fichier existe déjà sur TR4KER (preflight) → cross-seed de la version existante
+      async function crossExisting() {
+        const u = up.value
+        u.busy = true
+        try {
+          const r = await api.fetch('/cross-seed', { method: 'POST', body: { slug: u.prep.existing.slug, target_hash: u.item.hash, config: u.item.config } })
+          u.item.status = 'done'
+          api.ui.toast('Cross-seed lancé', `Ajouté dans ${r.savepath} — le client vérifie puis seed`)
+          up.value = null
+          loadMap()
+        } catch (e) {
+          api.ui.toast('Cross-seed : échec', e?.data?.statusMessage || e?.message || 'Erreur inconnue')
+          u.busy = false
+        }
+      }
+      const goFiche = (slug) => { window.location.href = '/torrent/' + slug }
+
       const fails = (b) => (b.errors ? ' (' + b.errors + ' échec' + (b.errors > 1 ? 's' : '') + ')' : '')
       async function crossAll() {
         const todo = (scan.value?.items || []).filter((t) => t.status === 'cross') // taille exacte uniquement
@@ -687,6 +869,7 @@ export default function setup(api) {
         torrents, status, loading, configured, configs, selected, select, refresh, fmtSpeed, fmtBytes, stateLabel, stateClass,
         tab, scan, scanning, scanErr, filter, rowBusy, bulk, countsC, crossable, multiCfg, FILTERS, visible,
         doScan, openCross, crossOne, crossAll, fails, fmtAgo,
+        up, parentCats, subCats, tagHint, openUpload, pickTmdb, submitUpload, crossExisting, goFiche,
       }
     },
   }

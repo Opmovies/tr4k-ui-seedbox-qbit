@@ -77,6 +77,25 @@ info_hash). Chaque torrent ressort dans l'une de ces catégories :
 Le résultat est mis en cache 10 min côté serveur (« Réanalyser » force). Au-delà de
 400 candidats, seuls les plus récents sont analysés (signalé dans l'UI).
 
+### Upload assisté (v2.2, hôte ≥ 1.5.6, qBittorrent ≥ 4.5)
+
+Les releases « absentes du tracker » gagnent un bouton **Uploader** :
+
+1. le `.torrent` est **exporté** depuis qBittorrent puis **reconstruit** pour TR4KER
+   (`private=1` + `source=TR4KER` → nouvel info_hash, données identiques — même logique
+   que le flux d'import du site) ;
+2. **preflight anti-doublon** sur les deux hash (reconstruit ET original — les torrents
+   migrés gardent leur hash d'origine) : si le fichier existe déjà, la modale propose un
+   cross-seed à la place ;
+3. la fiche est **pré-remplie** : nom, catégorie devinée, suggestion TMDB (affiche),
+   année, tags, présentation BBCode générée ; NFO/MediaInfo en option ;
+4. l'upload part en multipart via l'hôte (cadencé anti-429), puis le torrent TR4KER est
+   **remis en seed** sur les fichiers d'origine (désactivable). Il reste « en attente de
+   validation » côté staff, comme un upload normal.
+
+Hydra n'expose pas d'export de `.torrent` : le bouton renvoie une erreur explicite pour
+ces configs.
+
 ## Structure
 
 - `plugin.json` — manifeste (slots, permissions ; pas de champs de réglages : l'UI est fournie par le plugin)
