@@ -5,6 +5,8 @@
 // stockées chiffrées par l'hôte via ctx.settings/saveSettings.
 
 import { randomUUID } from 'node:crypto'
+import { readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 // ⚠️ Node ne ré-importe JAMAIS une URL ESM déjà vue : l'hôte cache-buste server.mjs
 // (?v=rev-mtime) à chaque mise à jour du plugin, mais un import relatif « nu » garderait
@@ -138,6 +140,15 @@ async function matchBatch(ctx, lines) {
 
 const preparedUploads = new Map() // `${userKey}:${infoHash}` -> { at, prep, configId }
 const PREP_TTL = 20 * 60_000
+
+// Journal PERSISTANT des uploads faits d'ici (dataDir) : tant qu'un upload est en attente
+// de validation, migrations/match ne le renvoie pas → sans ce journal, l'original
+// retomberait en « absent » au re-scan suivant. hash ORIGINAL -> {slug, new_hash, at}.
+const uploadsPath = (ctx) => join(ctx.dataDir, String(ctx.userKey).replace(/[^A-Za-z0-9_-]/g, '_') + '.uploads.json')
+function loadUploads(ctx) {
+  try { return JSON.parse(readFileSync(uploadsPath(ctx), 'utf8')) } catch { return {} }
+}
+const saveUploads = (ctx, v) => writeFileSync(uploadsPath(ctx), JSON.stringify(v, null, 1))
 
 const RX = {
   res: /\b(2160p|1080p|720p|576p|480p|4K|UHD)\b/i,
@@ -342,6 +353,11 @@ export const routes = {
     if (!configsOut.some((x) => x.ok))
       throw ctx.h3.createError({ statusCode: 502, statusMessage: `Aucune seedbox joignable (${configsOut[0]?.error || '?'})` })
 
+    // tailles exactes des torrents annonçant TR4KER : si l'un d'eux a la MÊME taille à
+    // l'octet qu'un candidat, sa version TR4KER seede déjà (upload/cross-seed passé) —
+    // couvre aussi les releases que le matcher du site rate
+    const tr4kSizes = new Set(entries.filter((t) => isTr4kTracker(t.tracker)).map((t) => t.size).filter(Boolean))
+
     // 2) candidats : terminés, n'annonçant pas (ou plus) TR4KER — les torrents TR4KER
     // au tracker en erreur (champ vide) passent ici puis ressortent en 'same' via le hash
     let candidates = entries.filter((t) => (t.progress ?? 0) >= 0.999 && !isTr4kTracker(t.tracker))
@@ -354,6 +370,8 @@ export const routes = {
     const matches = lines.length ? await matchBatch(ctx, lines) : new Map()
 
     // 4) classement
+    const uploads = loadUploads(ctx)
+    let uploadsDirty = false
     const items = candidates.map((t) => {
       const m = matches.get(String(t.name || '').trim()) || matches.get(t.hash) || null
       let status = 'absent'
@@ -364,6 +382,13 @@ export const routes = {
         else if (Math.abs((m.size_bytes || 0) - (t.size || 0)) / Math.max(m.size_bytes || 1, t.size || 1) <= 0.02) status = 'near'
         else status = 'diff'
       }
+      if (status === 'done' && uploads[t.hash]) { delete uploads[t.hash]; uploadsDirty = true } // validé et matché : journal purgé
+      if (status === 'absent') {
+        // uploadé d'ici mais pas encore validé (le matcher ne le renvoie pas) → « uploadé »
+        if (uploads[t.hash]) status = 'uploaded'
+        // version TR4KER de MÊME taille exacte déjà sur la box → elle seede déjà
+        else if (t.size && tr4kSizes.has(t.size)) status = 'done'
+      }
       return {
         hash: t.hash, name: t.name, size: t.size, added_on: t.added_on,
         config: t.config, config_name: t.config_name, status,
@@ -372,6 +397,7 @@ export const routes = {
       }
     })
 
+    if (uploadsDirty) try { saveUploads(ctx, uploads) } catch {}
     const counts = {}
     for (const i of items) counts[i.status] = (counts[i.status] || 0) + 1
     const data = { scanned_at: Date.now(), configs: configsOut, truncated, counts, items }
@@ -503,6 +529,13 @@ export const routes = {
     }
     preparedUploads.delete(`${ctx.userKey}:${infoHash}`)
     scanCache.delete(ctx.userKey)
+    // journal persistant : l'ORIGINAL reste classé « uploadé » aux prochains scans,
+    // même tant que le torrent attend sa validation côté staff
+    try {
+      const uploads = loadUploads(ctx)
+      uploads[prep.originalHash] = { slug: res?.slug || res?.torrent?.slug || null, new_hash: prep.infoHash, name, at: Date.now() }
+      saveUploads(ctx, uploads)
+    } catch (e) { ctx.log(`journal des uploads inaccessible (${e?.message})`) }
     ctx.log(`upload « ${name} » envoyé au tracker (cat ${catSlug}${seeded ? ', remis en seed' : ''})`)
     return { ok: true, slug: res?.slug || res?.torrent?.slug || null, seeded, response: res }
   },
