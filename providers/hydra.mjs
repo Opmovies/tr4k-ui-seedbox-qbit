@@ -7,7 +7,7 @@
 //   - cross-seed : `skip_checking=true` recommandé par la doc Hydra pour seeder des
 //     fichiers déjà présents (savepath = dossier EXACT du contenu).
 
-import { torrentForm, parseAddResult, netErr } from './multipart.mjs'
+const { torrentForm, parseAddResult, netErr } = await import(`./multipart.mjs${new URL(import.meta.url).search}`)
 
 function baseOf(cfg, io) {
   const url = (cfg.url || '').trim().replace(/\/+$/, '')

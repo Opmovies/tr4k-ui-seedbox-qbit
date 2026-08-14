@@ -28,8 +28,11 @@
 //         pour les sessions internes du provider (cookies, etc.).
 //   io  = { createError } — fabrique d'erreurs H3 pour des messages propres côté UI.
 
-import qbittorrent from './qbittorrent.mjs'
-import hydra from './hydra.mjs'
+// imports dynamiques avec le cache-buster de l'hôte propagé (cf. note de server.mjs) :
+// sans lui, une mise à jour du plugin garderait les anciens providers jusqu'au restart
+const V = new URL(import.meta.url).search
+const qbittorrent = (await import(`./qbittorrent.mjs${V}`)).default
+const hydra = (await import(`./hydra.mjs${V}`)).default
 
 export const providers = { [qbittorrent.id]: qbittorrent, [hydra.id]: hydra }
 

@@ -9,7 +9,7 @@
 // Sessions par (utilisateur, config) : chaque config a SA seedbox. Mutex de login
 // (qBittorrent 5.x bannit l'IP après plusieurs échecs), UNE seule re-login sur 403.
 
-import { torrentForm, parseAddResult, netErr } from './multipart.mjs'
+const { torrentForm, parseAddResult, netErr } = await import(`./multipart.mjs${new URL(import.meta.url).search}`)
 
 const sessions = new Map() // cfg._key -> { cookie: 'NAME=val' | null (auth proxy), loggingIn: Promise|null }
 

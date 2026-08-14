@@ -5,8 +5,15 @@
 // stockées chiffrées par l'hôte via ctx.settings/saveSettings.
 
 import { randomUUID } from 'node:crypto'
-import { providers, getProvider, providersMeta } from './providers/index.mjs'
-import { rebuildTorrent } from './bencode.mjs'
+
+// ⚠️ Node ne ré-importe JAMAIS une URL ESM déjà vue : l'hôte cache-buste server.mjs
+// (?v=rev-mtime) à chaque mise à jour du plugin, mais un import relatif « nu » garderait
+// les ANCIENS modules en mémoire jusqu'au redémarrage (bug réel : providers 2.1.0 sous un
+// server.mjs 2.2.0 → « ne sait pas exporter »). On propage donc le cache-buster de l'hôte
+// (présent dans import.meta.url) à tous les imports internes.
+const V = new URL(import.meta.url).search
+const { providers, getProvider, providersMeta } = await import(`./providers/index.mjs${V}`)
+const { rebuildTorrent } = await import(`./bencode.mjs${V}`)
 
 const SENTINEL = '••••' // même sentinelle que l'hôte : reçue = « valeur inchangée »
 
@@ -360,6 +367,7 @@ export const routes = {
       return {
         hash: t.hash, name: t.name, size: t.size, added_on: t.added_on,
         config: t.config, config_name: t.config_name, status,
+        tracker: t.tracker || '', // tracker ACTUEL du torrent (provenance), affiché par la page
         match: m ? { slug: m.slug, name: m.name, size_bytes: m.size_bytes, seeders: m.seeders } : null,
       }
     })

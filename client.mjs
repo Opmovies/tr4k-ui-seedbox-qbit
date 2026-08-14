@@ -467,12 +467,13 @@ export default function setup(api) {
 
               <div class="tablewrap">
                 <table>
-                  <thead><tr><th>Nom</th><th v-if="multiCfg">Config</th><th class="num">Taille</th><th class="num">Seeders TR4KER</th><th style="width:1%"></th></tr></thead>
+                  <thead><tr><th>Nom</th><th v-if="multiCfg">Config</th><th>Tracker actuel</th><th class="num">Taille</th><th class="num">Seeders TR4KER</th><th style="width:1%"></th></tr></thead>
                   <tbody>
                     <tr v-for="t in visible" :key="t.config + t.hash">
                       <td class="grow" style="font-size:12.5px; max-width:460px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap"
                           :title="t.name + (t.match && t.match.name !== t.name ? '\\n→ sur TR4KER : ' + t.match.name : '')">{{ t.name }}</td>
                       <td v-if="multiCfg"><span class="badge">{{ t.config_name }}</span></td>
+                      <td class="mono muted" style="font-size:11.5px" :title="t.tracker">{{ trackerHost(t.tracker) }}</td>
                       <td class="num mono">{{ fmtBytes(t.size) }}</td>
                       <td class="num mono">{{ t.match ? t.match.seeders : '—' }}</td>
                       <td style="white-space:nowrap">
@@ -496,7 +497,7 @@ export default function setup(api) {
                       </td>
                     </tr>
                     <tr v-if="!visible.length">
-                      <td :colspan="multiCfg ? 5 : 4" class="empty">
+                      <td :colspan="multiCfg ? 6 : 5" class="empty">
                         {{ scan.items.length ? 'Rien dans cette catégorie.' : 'Aucun torrent terminé venant d\\'un autre tracker — rien à cross-seeder.' }}
                       </td>
                     </tr>
@@ -796,6 +797,9 @@ export default function setup(api) {
         }
       }
       const goFiche = (slug) => { window.location.href = '/torrent/' + slug }
+      const trackerHost = (u) => {
+        try { return new URL(u).hostname.replace(/^(www|connect|tracker|announce)\./, '') } catch { return u ? '?' : '—' }
+      }
 
       const fails = (b) => (b.errors ? ' (' + b.errors + ' échec' + (b.errors > 1 ? 's' : '') + ')' : '')
       async function crossAll() {
@@ -869,7 +873,7 @@ export default function setup(api) {
         torrents, status, loading, configured, configs, selected, select, refresh, fmtSpeed, fmtBytes, stateLabel, stateClass,
         tab, scan, scanning, scanErr, filter, rowBusy, bulk, countsC, crossable, multiCfg, FILTERS, visible,
         doScan, openCross, crossOne, crossAll, fails, fmtAgo,
-        up, parentCats, subCats, tagHint, openUpload, pickTmdb, submitUpload, crossExisting, goFiche,
+        up, parentCats, subCats, tagHint, openUpload, pickTmdb, submitUpload, crossExisting, goFiche, trackerHost,
       }
     },
   }
