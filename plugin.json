@@ -1,7 +1,7 @@
 {
   "id": "seedbox-qbit",
   "name": "Seedbox",
-  "version": "2.2.1",
+  "version": "2.3.0",
   "description": "Envoie les torrents vers ta ou tes seedbox (qBittorrent, Hydra…) : multi-configurations, cross-seed, suivi.",
   "author": "Opmovies",
   "icon": "HardDriveDownload",

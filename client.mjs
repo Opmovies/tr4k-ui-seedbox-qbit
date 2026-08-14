@@ -542,8 +542,12 @@ export default function setup(api) {
 
                   <form v-else style="display:flex; flex-direction:column; gap:11px" @submit.prevent="submitUpload">
                     <label style="display:flex; flex-direction:column; gap:5px">
-                      <span style="font-size:12px">Nom de la release *</span>
-                      <input v-model="up.form.name" type="text" required />
+                      <span style="font-size:12px; display:flex; gap:8px; align-items:center">Nom de la release *
+                        <button type="button" class="ghost small" style="padding:2px 9px; font-size:11px"
+                                title="Reconstruit le nom selon la nomenclature scene : Titre TMDB (translittéré) + année/SxxEyy + langue + résolution + source + codec - team"
+                                @click="up.form.name = nomenclature()">Nomenclature</button>
+                      </span>
+                      <input v-model="up.form.name" type="text" required class="mono" style="font-size:12.5px" />
                     </label>
                     <div style="display:flex; gap:10px; flex-wrap:wrap">
                       <label style="display:flex; flex-direction:column; gap:5px; flex:1; min-width:170px">
@@ -582,12 +586,24 @@ export default function setup(api) {
                       <input v-model="up.form.tags" type="text" :placeholder="tagHint" />
                     </label>
                     <label style="display:flex; flex-direction:column; gap:5px">
+                      <span style="font-size:12px">Description (synopsis) — pré-remplie depuis l'œuvre TMDB choisie</span>
+                      <textarea v-model="up.form.description" rows="3" style="font-size:12.5px" />
+                    </label>
+                    <label style="display:flex; flex-direction:column; gap:5px">
                       <span style="font-size:12px">Présentation (BBCode)</span>
                       <textarea v-model="up.form.presentation" rows="6" class="mono" style="font-size:12px" />
                     </label>
                     <label style="display:flex; flex-direction:column; gap:5px">
-                      <span style="font-size:12px">NFO / MediaInfo (optionnel mais apprécié du staff)</span>
-                      <textarea v-model="up.form.nfo" rows="3" class="mono" style="font-size:12px" placeholder="Colle ici la sortie mediainfo si tu l'as" />
+                      <span style="font-size:12px; display:flex; gap:8px; align-items:center">NFO
+                        <button type="button" class="ghost small" style="padding:2px 9px; font-size:11px"
+                                title="Regénère le NFO (titre + synopsis TMDB, attributs de la release, liste des fichiers)"
+                                @click="regenNfo">Régénérer</button>
+                      </span>
+                      <textarea v-model="up.form.nfo" rows="6" class="mono" style="font-size:11.5px" />
+                      <span class="muted" style="font-size:11px">
+                        Un vrai MediaInfo ne peut pas être généré d'ici (les fichiers sont sur la seedbox) :
+                        si tu l'as, colle-le à la place du NFO généré.
+                      </span>
                     </label>
                     <div style="display:flex; gap:16px; flex-wrap:wrap">
                       <label class="sw" :class="{ on: up.form.seed_after }" @click="up.form.seed_after = !up.form.seed_after">
@@ -746,26 +762,88 @@ export default function setup(api) {
             name: prep.name,
             category_slug: prep.category_guess || '',
             subcategory_slug: '',
-            year: rel.year || '',
+            year: rel.year || prep.tmdb[0]?.year || '',
             tmdb_id: prep.tmdb[0]?.id || 0,
             tmdb_type: prep.tmdb_type,
             poster_url: prep.tmdb[0]?.poster_url || '',
             tags: [rel.resolution, rel.lang].filter(Boolean).join(', '),
             presentation: prep.presentation,
             nfo: '',
-            description: '',
+            description: prep.tmdb[0]?.overview || '',
             is_anonymous: false,
             seed_after: true,
           })
+          regenNfo() // NFO généré d'office (gabarit tr4ker_upload : œuvre, attributs, fichiers)
         } catch (e) {
           up.value.err = e?.data?.statusMessage || e?.message || 'Erreur inconnue'
         }
         up.value.loading = false
       }
+      const chosenTmdb = () => (up.value?.prep?.tmdb || []).find((r) => r.id === up.value?.form?.tmdb_id) || null
+
+      /** NFO généré (même gabarit que tr4ker_upload.py : entête, œuvre TMDB + synopsis,
+       *  attributs de la release, liste des fichiers plafonnée à 40). */
+      function makeNfo() {
+        const u = up.value
+        const p = u.prep, r = p.release, t = chosenTmdb()
+        const bar = '='.repeat(70)
+        const lines = [bar, '  ' + (u.form.name || p.name), bar, '']
+        if (t) {
+          lines.push(`  Titre ....... : ${t.title}${t.year ? ` (${t.year})` : ''}`)
+          if (t.overview) {
+            lines.push('')
+            for (const l of wrap(t.overview, 66)) lines.push('  ' + l)
+            lines.push('')
+          }
+        }
+        const rows = [['Annee', u.form.year || r.year], ['Resolution', r.resolution], ['Source', r.source],
+          ['Video', r.video], ['Audio', r.audio], ['Langue', r.lang], ['Team', r.group],
+          ['Taille', fmtBytes(p.size)], ['Fichiers', String(p.file_count)]]
+        for (const [k, v] of rows) if (v) lines.push(`  ${k.padEnd(12)} : ${v}`)
+        lines.push('', '-'.repeat(70), '  Fichiers :', '-'.repeat(70))
+        for (const f of (p.files || []).slice(0, 40)) lines.push(`  ${fmtBytes(f.size).padStart(12)}   ${f.path}`)
+        if (p.file_count > 40) lines.push(`  … et ${p.file_count - 40} autres fichiers`)
+        lines.push('', '  Upload via TR4K UI · source TR4KER', bar)
+        return lines.join('\n')
+      }
+      function wrap(s, w) {
+        const out = []
+        let line = ''
+        for (const word of String(s).split(/\s+/)) {
+          if (line && (line + ' ' + word).length > w) { out.push(line); line = word }
+          else line = line ? line + ' ' + word : word
+        }
+        if (line) out.push(line)
+        return out
+      }
+
+      /** Nom de release reconstruit (nomenclature scene) depuis l'œuvre TMDB + attributs détectés. */
+      const scene = (s) => String(s || '').normalize('NFKD').replace(/[̀-ͯ]/g, '')
+        .replace(/[^A-Za-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '')
+      function nomenclature() {
+        const u = up.value
+        const r = u.prep.release, t = chosenTmdb()
+        const pad = (n) => String(n).padStart(2, '0')
+        const parts = [scene(t?.title || r.title || u.prep.name)]
+        if (r.season) parts.push('S' + pad(r.season) + (r.episode ? 'E' + pad(r.episode) : ''))
+        else if (u.form.year || t?.year || r.year) parts.push(String(u.form.year || t?.year || r.year))
+        for (const v of [r.lang, r.resolution, r.source, r.audio, r.video]) if (v) parts.push(v)
+        return parts.join('.') + '-' + (r.group || 'NoTag')
+      }
+
       function pickTmdb(r) {
-        up.value.form.tmdb_id = r?.id || 0
-        up.value.form.poster_url = r?.poster_url || ''
-        if (r?.year && !up.value.form.year) up.value.form.year = String(r.year)
+        const f = up.value.form
+        const prev = chosenTmdb()
+        f.tmdb_id = r?.id || 0
+        f.poster_url = r?.poster_url || ''
+        if (r?.year && !f.year) f.year = String(r.year)
+        // description et NFO suivent le choix TMDB tant que l'utilisateur ne les a pas retouchés
+        if (!f.description || f.description === (prev?.overview || '')) f.description = r?.overview || ''
+        if (f.nfo === up.value.autoNfo) regenNfo()
+      }
+      function regenNfo() {
+        up.value.form.nfo = makeNfo()
+        up.value.autoNfo = up.value.form.nfo
       }
       async function submitUpload() {
         const u = up.value
@@ -861,7 +939,8 @@ export default function setup(api) {
         return m < 1 ? 'à l’instant' : m < 60 ? `il y a ${m} min` : `il y a ${Math.round(m / 60)} h`
       }
       const fmtSpeed = (b) => !b ? '—' : b >= 1048576 ? (b / 1048576).toFixed(1) + ' Mo/s' : Math.round(b / 1024) + ' Ko/s'
-      const fmtBytes = (b) => !b ? '—' : b >= 1073741824 ? (b / 1073741824).toFixed(2) + ' Go' : (b / 1048576).toFixed(0) + ' Mo'
+      const fmtBytes = (b) => !b ? '—' : b >= 1073741824 ? (b / 1073741824).toFixed(2) + ' Go'
+        : b >= 1048576 ? (b / 1048576).toFixed(0) + ' Mo' : Math.max(1, Math.round(b / 1024)) + ' Ko'
       const stateLabel = (s) => ({
         downloading: 'Téléchargement', stalledDL: 'En attente ↓', metaDL: 'Métadonnées',
         uploading: 'Seed', stalledUP: 'Seed (calme)', queuedDL: 'File ↓', queuedUP: 'File ↑',
@@ -874,6 +953,7 @@ export default function setup(api) {
         tab, scan, scanning, scanErr, filter, rowBusy, bulk, countsC, crossable, multiCfg, FILTERS, visible,
         doScan, openCross, crossOne, crossAll, fails, fmtAgo,
         up, parentCats, subCats, tagHint, openUpload, pickTmdb, submitUpload, crossExisting, goFiche, trackerHost,
+        makeNfo, regenNfo, nomenclature,
       }
     },
   }

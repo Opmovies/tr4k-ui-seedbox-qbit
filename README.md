@@ -87,8 +87,13 @@ Les releases « absentes du tracker » gagnent un bouton **Uploader** :
 2. **preflight anti-doublon** sur les deux hash (reconstruit ET original — les torrents
    migrés gardent leur hash d'origine) : si le fichier existe déjà, la modale propose un
    cross-seed à la place ;
-3. la fiche est **pré-remplie** : nom, catégorie devinée, suggestion TMDB (affiche),
-   année, tags, présentation BBCode générée ; NFO/MediaInfo en option ;
+3. la fiche est **pré-remplie et générée** (v2.3) : nom (bouton **Nomenclature** —
+   titre TMDB translittéré + année/SxxEyy + langue/résolution/source/codec-team),
+   catégorie devinée, suggestions TMDB (affiche), **description = synopsis TMDB**,
+   tags, présentation BBCode, **NFO généré** (œuvre + synopsis wrappé + attributs +
+   liste des fichiers, même gabarit que tr4ker_upload.py). Un vrai MediaInfo ne peut
+   pas être produit sans accès aux fichiers (ils sont sur la seedbox) : colle-le à la
+   place du NFO généré si tu l'as ;
 4. l'upload part en multipart via l'hôte (cadencé anti-429), puis le torrent TR4KER est
    **remis en seed** sur les fichiers d'origine (désactivable). Il reste « en attente de
    validation » côté staff, comme un upload normal.

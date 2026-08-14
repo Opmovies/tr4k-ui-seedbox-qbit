@@ -406,11 +406,14 @@ export const routes = {
     const rel = parseRelease(prep.name)
     let cats = []
     try { cats = (await ctx.lib.tr4kGet('public/categories', {}, ctx.auth)).data || [] } catch {}
+    // tmdb/search (et pas suggest) : il renvoie AUSSI le synopsis (overview), dont la
+    // modale se sert pour générer description + NFO
     let tmdb = []
     if (rel.title) {
       try {
-        const r = await ctx.lib.tr4kGet('tmdb/suggest', { q: rel.title }, ctx.auth)
+        const r = await ctx.lib.tr4kGet('tmdb/search', { q: rel.title, type: rel.season ? 'tv' : 'movie' }, ctx.auth)
         tmdb = (r?.data?.results || []).slice(0, 5)
+          .map((x) => ({ id: x.id, type: x.type, title: x.title, year: x.year, poster_url: x.poster_url || '', overview: x.overview || '' }))
       } catch {}
     }
 
@@ -420,6 +423,7 @@ export const routes = {
     return {
       info_hash: prep.infoHash, original_hash: prep.originalHash,
       name: prep.name, size: prep.size, file_count: prep.files.length,
+      files: prep.files.slice(0, 300), // pour la génération du NFO côté modale (liste plafonnée)
       save_path: prep.save_path, config: c.id,
       release: rel, existing, // {slug, name…} si le FICHIER est déjà sur TR4KER
       categories: cats.map((x) => ({ id: x.id, slug: x.slug, name: x.name, parent_id: x.parent_id || null })),
